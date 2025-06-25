@@ -22,7 +22,7 @@ def track(path):
         decoded = base64.urlsafe_b64decode(padded.encode())
         metadata = json.loads(decoded)
 
-        email = metadata.get("email", "Unknown")
+        email = metadata.get("metadata", {}).get("email", "Unknown")
     except Exception as e:
         email = f"Error decoding: {e}"
 
