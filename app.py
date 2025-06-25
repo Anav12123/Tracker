@@ -8,44 +8,43 @@ import requests
 app = Flask(__name__)
 
 #  Replace with your actual Google Apps Script Web App URL
-GOOGLE_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxvCnw0fTyapsx34H0IV7KtaLaBdbivvIdiy4LMVtFXxBAiKssHUa8kOPNBgCfDBg9u/exec"
+GOOGLE_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbza9wBiZdShn9GSzckoVnia3wa2p7hjkWOpI2PHF0x-JrGgIIqHPO2zTvh1-UlPBIY/exec"
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def track(path):
+    # decode the base64 path → {"metadata":{"email": "..."}}
     try:
-        # Remove file extension like ".png"
-        path = path.split('.')[0]
-
-        # Base64 decode with padding fix
-        padded = path + '=' * (-len(path) % 4)
+        key = path.split('.')[0]
+        padded = key + '=' * (-len(key) % 4)
         decoded = base64.urlsafe_b64decode(padded.encode())
-        metadata = json.loads(decoded)
-
-        email = metadata.get("metadata", {}).get("email", "Unknown")
+        meta = json.loads(decoded)
+        email = meta.get("metadata", {}).get("email", "Unknown")
     except Exception as e:
-        email = f"Error decoding: {e}"
+        email = "Error:" + str(e)
 
-    timestamp = str(datetime.now())
-
-    #  Post to Google Sheets
+    ts = datetime.utcnow().isoformat()
+    payload = {
+        "type":      "open",
+        "email":     email,
+        "timestamp": ts
+    }
+    # fire the webhook
     try:
-        payload = {"timestamp": timestamp, "email": email}
-        response = requests.post(GOOGLE_SHEET_WEBHOOK_URL, json=payload)
-        print(f"Webhook status: {response.status_code} - {response.text}")
-    except Exception as post_error:
-        print(f"Failed to post to Google Sheets: {post_error}")
+        r = requests.post(GOOGLE_SHEET_WEBHOOK_URL, json=payload)
+        print("OPEN→", r.status_code, r.text)
+    except Exception as e:
+        print("OPEN ERR→", e)
 
-    #  Local backup
-    with open("opens.log", "a") as log:
-        log.write(f"{timestamp} - OPENED: {email}\n")
+    # local backup
+    with open("opens.log","a") as f:
+        f.write(f"{ts} OPENED {email}\n")
 
     return send_file("pixel.png", mimetype="image/png")
 
-@app.route('/health')
+@app.route("/health")
 def health():
-    return "Tracking server is live."
+    return "OK"
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)))
