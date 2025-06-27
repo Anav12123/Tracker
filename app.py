@@ -11,7 +11,7 @@ app = Flask(__name__)
 # === Google Sheets Setup ===
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive" 
+    "https://www.googleapis.com/auth/drive"
 ]
 
 SPREADSHEET_NAME = "EmailTRACKV2"
@@ -22,10 +22,9 @@ creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 client = gspread.authorize(creds)
 sheet = client.open(SPREADSHEET_NAME).sheet1
 
-def update_sheet(email, sender, timestamp):
+def update_sheet(email, sender, timestamp, stage=None):
     headers = sheet.row_values(1)
-    col_map = {key: idx for idx, key in enumerate(headers)}
-
+    col_map = {key.strip(): idx for idx, key in enumerate(headers)}
     data = sheet.get_all_values()[1:]  # Exclude header row
     found = False
 
@@ -39,6 +38,17 @@ def update_sheet(email, sender, timestamp):
             sheet.update_cell(row_num, col_map["Status"] + 1, "OPENED")
             if "From" in col_map:
                 sheet.update_cell(row_num, col_map["From"] + 1, sender)
+
+            # Stage-specific open tracking
+            if stage:
+                open_col = {
+                    "fw_1": "Opened_FW1",
+                    "fw_2": "Opened_FW2",
+                    "fw_3": "Opened_FW3"
+                }.get(stage)
+                if open_col and open_col in col_map:
+                    sheet.update_cell(row_num, col_map[open_col] + 1, timestamp)
+
             found = True
             break
 
@@ -51,12 +61,20 @@ def update_sheet(email, sender, timestamp):
         new_row[col_map["Last_Open"]] = timestamp
         if "From" in col_map:
             new_row[col_map["From"]] = sender
+        if stage:
+            open_col = {
+                "fw_1": "Opened_FW1",
+                "fw_2": "Opened_FW2",
+                "fw_3": "Opened_FW3"
+            }.get(stage)
+            if open_col and open_col in col_map:
+                new_row[col_map[open_col]] = timestamp
         sheet.append_row(new_row)
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def track(path):
-    email = sender = None
+    email = sender = stage = None
     timestamp = str(datetime.now())
 
     try:
@@ -66,18 +84,19 @@ def track(path):
         metadata = json.loads(decoded)
         email = metadata.get("metadata", {}).get("email")
         sender = metadata.get("metadata", {}).get("sender")
+        stage  = metadata.get("metadata", {}).get("stage")
     except Exception as e:
-        print(f" Invalid metadata: {e}")
+        print(f"⚠ Invalid metadata: {e}")
 
     if email and sender:
         try:
-            update_sheet(email, sender, timestamp)
-            print(f" Tracked: {email} from {sender}")
+            update_sheet(email, sender, timestamp, stage=stage)
+            print(f"📬 Tracked: {email} from {sender} (stage: {stage})")
         except Exception as err:
             print(f" Sheet update failed: {err}")
 
         with open("opens.log", "a") as log:
-            log.write(f"{timestamp} - OPENED: {email} (from {sender})\n")
+            log.write(f"{timestamp} - OPENED: {email} (from {sender}, stage: {stage})\n")
 
     return send_file("pixel.png", mimetype="image/png")
 
