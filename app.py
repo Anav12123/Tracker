@@ -9,7 +9,11 @@ from google.oauth2.service_account import Credentials
 app = Flask(__name__)
 
 # === Google Sheets Setup ===
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive" 
+]
+
 SPREADSHEET_NAME = "EmailTRACKV2"
 
 # Load credentials from Render environment variable
