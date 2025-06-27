@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 # === Google Sheets Setup ===
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SPREADSHEET_NAME = "EmailTracker"
+SPREADSHEET_NAME = "EmailTRACKV2"
 
 # Load credentials from Render environment variable
 creds_info = json.loads(os.environ["GOOGLE_CREDS_JSON"])
