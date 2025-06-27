@@ -8,7 +8,7 @@ import requests
 app = Flask(__name__)
 
 # Replace with your actual Google Apps Script Web App URL
-GOOGLE_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbyGXuBDG8BooiYFv8q0V39lAKj0GAZAKhE1LQ5o7c2DgZloLiSBRDyaY_LfcIo9bLIn/exec"
+GOOGLE_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbz-8odslCLtMLPs_b2ekVw7ZkTfEKm0AWkSDzqZn0ZA_tNTq1L_V1gzmzatJcoRve0/exec"
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
