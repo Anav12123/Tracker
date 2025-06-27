@@ -39,7 +39,7 @@ def update_sheet(email, sender, timestamp, stage=None):
             if "From" in col_map:
                 sheet.update_cell(row_num, col_map["From"] + 1, sender)
 
-            # Stage-specific open tracking
+            #  Mark open with YES instead of timestamp
             if stage:
                 open_col = {
                     "fw_1": "Opened_FW1",
@@ -47,7 +47,7 @@ def update_sheet(email, sender, timestamp, stage=None):
                     "fw_3": "Opened_FW3"
                 }.get(stage)
                 if open_col and open_col in col_map:
-                    sheet.update_cell(row_num, col_map[open_col] + 1, timestamp)
+                    sheet.update_cell(row_num, col_map[open_col] + 1, "YES")
 
             found = True
             break
@@ -68,7 +68,7 @@ def update_sheet(email, sender, timestamp, stage=None):
                 "fw_3": "Opened_FW3"
             }.get(stage)
             if open_col and open_col in col_map:
-                new_row[col_map[open_col]] = timestamp
+                new_row[col_map[open_col]] = "YES"
         sheet.append_row(new_row)
 
 @app.route('/', defaults={'path': ''})
@@ -91,7 +91,7 @@ def track(path):
     if email and sender:
         try:
             update_sheet(email, sender, timestamp, stage=stage)
-            print(f"📬 Tracked: {email} from {sender} (stage: {stage})")
+            print(f" Tracked: {email} from {sender} (stage: {stage})")
         except Exception as err:
             print(f" Sheet update failed: {err}")
 
