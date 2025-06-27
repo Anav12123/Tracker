@@ -7,35 +7,40 @@ import requests
 
 app = Flask(__name__)
 
-# Replace with your actual Google Apps Script Web App URL
+# Your existing Apps Script Web App URL
 GOOGLE_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbz6Wc0gBTSA2A0dfOHowgIHKyqgRoLrkN_ufbrizsshmLBl7FJ0E9UvsKesQkGYZGVH/exec"
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def track(path):
+    email = None
     try:
-        path = path.split('.')[0]  # Remove any file extension
-        padded = path + '=' * (-len(path) % 4)
+        # exactly as before: strip extension, pad & decode
+        token  = path.split('.')[0]
+        padded = token + '=' * (-len(token) % 4)
         decoded = base64.urlsafe_b64decode(padded.encode())
         metadata = json.loads(decoded)
-
-        # Access email nested under 'metadata'
-        email = metadata.get("metadata", {}).get("email", "Unknown")
-    except Exception as e:
-        email = f"Error decoding: {e}"
+        # safe‐get your email
+        email = metadata.get("metadata", {}).get("email")
+    except Exception:
+        # any decode/parsing error → email stays None
+        pass
 
     timestamp = str(datetime.now())
 
-    try:
-        payload = {"timestamp": timestamp, "email": email}
-        response = requests.post(GOOGLE_SHEET_WEBHOOK_URL, json=payload)
-        print(f"Webhook status: {response.status_code} - {response.text}")
-    except Exception as post_error:
-        print(f"Failed to post to Google Sheets: {post_error}")
+    # only post & log when we got a real email
+    if email:
+        try:
+            payload = {"timestamp": timestamp, "email": email}
+            response = requests.post(GOOGLE_SHEET_WEBHOOK_URL, json=payload)
+            print(f"Webhook status: {response.status_code} - {response.text}")
+        except Exception as post_error:
+            print(f"Failed to post to Google Sheets: {post_error}")
 
-    with open("opens.log", "a") as log:
-        log.write(f"{timestamp} - OPENED: {email}\n")
+        with open("opens.log", "a") as log:
+            log.write(f"{timestamp} - OPENED: {email}\n")
 
+    # always return the 1×1 tracking pixel
     return send_file("pixel.png", mimetype="image/png")
 
 @app.route('/health')
