@@ -1,82 +1,109 @@
-#!/usr/bin/env python3
-import os, io, json, base64
+from flask import Flask, request, send_file
 from datetime import datetime
-from flask import Flask, send_file, abort
+import base64
+import json
+import os
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread.utils import rowcol_to_a1
 
-# === CONFIG ===
-SERVICE_ACCOUNT_FILE = "service-account.json"
-GOOGLE_SHEET_NAME    = "EmailTRACKV2"
+app = Flask(__name__)
+
+# === Google Sheets Setup ===
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-# 1×1 transparent PNG or GIF
-PIXEL_PATH = "pixel.png"  # include this in your project
+SPREADSHEET_NAME = "EmailTRACKV2"
 
-# === SHEET AUTH ===
-creds  = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-sheet  = gspread.authorize(creds).open(GOOGLE_SHEET_NAME).sheet1
-HEADERS= [h.strip() for h in sheet.row_values(1)]
+# Load credentials from Render environment variable
+creds_info = json.loads(os.environ["GOOGLE_CREDS_JSON"])
+creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+client = gspread.authorize(creds)
+sheet = client.open(SPREADSHEET_NAME).sheet1
 
-# Stage→column mapping
-STAGE_COL = {
-    "fw_1": "Opened_FW1",
-    "fw_2": "Opened_FW2",
-    "fw_3": "Opened_FW3"
-}
+def update_sheet(email, sender, timestamp, stage=None):
+    headers = sheet.row_values(1)
+    col_map = {key.strip(): idx for idx, key in enumerate(headers)}
+    data = sheet.get_all_values()[1:]  # Exclude header row
+    found = False
 
-app = Flask(__name__)
+    for i, row in enumerate(data):
+        if row[col_map["Email"]] == email:
+            row_num = i + 2
+            current_count = int(row[col_map["Open_count"]] or "0") + 1
 
-@app.route('/<token>')
-def track(token):
-    # 1) Decode the metadata
+            sheet.update_cell(row_num, col_map["Open_count"] + 1, current_count)
+            sheet.update_cell(row_num, col_map["Last_Open"] + 1, timestamp)
+            sheet.update_cell(row_num, col_map["Status"] + 1, "OPENED")
+            if "From" in col_map:
+                sheet.update_cell(row_num, col_map["From"] + 1, sender)
+
+            #  Mark open with YES instead of timestamp
+            if stage:
+                open_col = {
+                    "fw_1": "Opened_FW1",
+                    "fw_2": "Opened_FW2",
+                    "fw_3": "Opened_FW3"
+                }.get(stage)
+                if open_col and open_col in col_map:
+                    sheet.update_cell(row_num, col_map[open_col] + 1, "YES")
+
+            found = True
+            break
+
+    if not found:
+        new_row = ["" for _ in headers]
+        new_row[col_map["Timestamp"]] = timestamp
+        new_row[col_map["Status"]] = "OPENED"
+        new_row[col_map["Email"]] = email
+        new_row[col_map["Open_count"]] = 1
+        new_row[col_map["Last_Open"]] = timestamp
+        if "From" in col_map:
+            new_row[col_map["From"]] = sender
+        if stage:
+            open_col = {
+                "fw_1": "Opened_FW1",
+                "fw_2": "Opened_FW2",
+                "fw_3": "Opened_FW3"
+            }.get(stage)
+            if open_col and open_col in col_map:
+                new_row[col_map[open_col]] = "YES"
+        sheet.append_row(new_row)
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def track(path):
+    email = sender = stage = None
+    timestamp = str(datetime.now())
+
     try:
-        padded   = token + '=' * (-len(token) % 4)
-        raw      = base64.urlsafe_b64decode(padded)
-        payload  = json.loads(raw)
-        md       = payload["metadata"]
-        email    = md["email"].strip().lower()
-        sender   = md["sender"]
-        stage    = md.get("stage")
-    except Exception:
-        return abort(400)
+        token = path.split('.')[0]
+        padded = token + '=' * (-len(token) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode())
+        metadata = json.loads(decoded)
+        email = metadata.get("metadata", {}).get("email")
+        sender = metadata.get("metadata", {}).get("sender")
+        stage  = metadata.get("metadata", {}).get("stage")
+    except Exception as e:
+        print(f"⚠ Invalid metadata: {e}")
 
-    # 2) Find the row for this email
-    try:
-        cell = sheet.find(email, in_column=HEADERS.index("Email")+1)
-    except Exception:
-        # no such email → still return pixel
-        return send_file(PIXEL_PATH, mimetype="image/png")
+    if email and sender:
+        try:
+            update_sheet(email, sender, timestamp, stage=stage)
+            print(f" Tracked: {email} from {sender} (stage: {stage})")
+        except Exception as err:
+            print(f" Sheet update failed: {err}")
 
-    row = cell.row
-    now = datetime.utcnow().isoformat()
+        with open("opens.log", "a") as log:
+            log.write(f"{timestamp} - OPENED: {email} (from {sender}, stage: {stage})\n")
 
-    # 3) Increment Open_count
-    oc_cell   = sheet.cell(row, HEADERS.index("Open_count")+1)
-    new_count = int(oc_cell.value or "0") + 1
-    sheet.update_cell(row, oc_cell.col, new_count)
-
-    # 4) Last_Open + Status + From
-    sheet.update_cell(row, HEADERS.index("Last_Open")+1, now)
-    sheet.update_cell(row, HEADERS.index("Status"   )+1, "OPENED")
-    sheet.update_cell(row, HEADERS.index("From"     )+1, sender)
-
-    # 5) Mark the correct Opened_FW* column
-    col_name = STAGE_COL.get(stage)
-    if col_name and col_name in HEADERS:
-        sheet.update_cell(row, HEADERS.index(col_name)+1, "YES")
-
-    # 6) Return the pixel image
-    return send_file(PIXEL_PATH, mimetype="image/png")
+    return send_file("pixel.png", mimetype="image/png")
 
 @app.route('/health')
 def health():
-    return "OK"
+    return "Tracker is live and healthy."
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT",5000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
