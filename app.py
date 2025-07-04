@@ -15,14 +15,15 @@ SCOPES = [
 ]
 
 SPREADSHEET_NAME = "EmailTRACKV2"
+DEFAULT_SHEET_NAME = "EmailTRACKV2"
 
 # Load credentials from Render environment variable
 creds_info = json.loads(os.environ["GOOGLE_CREDS_JSON"])
 creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 client = gspread.authorize(creds)
-sheet = client.open(SPREADSHEET_NAME).sheet1
 
-def update_sheet(email, sender, timestamp, stage=None):
+
+def update_sheet(sheet, email, sender, timestamp, stage=None):
     headers = sheet.row_values(1)
     col_map = {key.strip(): idx for idx, key in enumerate(headers)}
     data = sheet.get_all_values()[1:]  # Exclude header row
@@ -85,12 +86,14 @@ def track(path):
         email = metadata.get("metadata", {}).get("email")
         sender = metadata.get("metadata", {}).get("sender")
         stage  = metadata.get("metadata", {}).get("stage")
+        sheet_name = metadata.get("metadata", {}).get("sheet", DEFAULT_SHEET_NAME)
+        sheet = client.open(sheet_name).sheet1
     except Exception as e:
         print(f"⚠ Invalid metadata: {e}")
 
     if email and sender:
         try:
-            update_sheet(email, sender, timestamp, stage=stage)
+            update_sheet(sheet, email, sender, timestamp, stage=stage)
             print(f" Tracked: {email} from {sender} (stage: {stage})")
         except Exception as err:
             print(f" Sheet update failed: {err}")
