@@ -36,9 +36,6 @@ def update_sheet(sheet, email, sender, timestamp, stage=None):
             sheet.update_cell(row_num, col_map["Open_count"] + 1, current_count)
             sheet.update_cell(row_num, col_map["Last_Open"] + 1, timestamp)
             sheet.update_cell(row_num, col_map["Status"] + 1, "OPENED")
-            if "Subject" in col_map and subject:
-                sheet.update_cell(row_num, col_map["Subject"] + 1, subject)
-
             if "From" in col_map:
                 sheet.update_cell(row_num, col_map["From"] + 1, sender)
 
@@ -60,12 +57,8 @@ def update_sheet(sheet, email, sender, timestamp, stage=None):
         new_row[col_map["Timestamp"]] = timestamp
         new_row[col_map["Status"]] = "OPENED"
         new_row[col_map["Email"]] = email
-        
         new_row[col_map["Open_count"]] = 1
         new_row[col_map["Last_Open"]] = timestamp
-        if "Subject" in col_map and subject:
-            new_row[col_map["Subject"]] = subject
-
         if "From" in col_map:
             new_row[col_map["From"]] = sender
         if stage:
@@ -93,11 +86,10 @@ def track(path):
         sender = metadata.get("metadata", {}).get("sender")
         stage  = metadata.get("metadata", {}).get("stage")
         sheet_name = metadata.get("metadata", {}).get("sheet", DEFAULT_SHEET_NAME)
-        subject = metadata.get("metadata", {}).get("subject", "")
         sheet = client.open(sheet_name).sheet1
         if not sheet.get_all_values():
             sheet.append_row([
-                "Timestamp", "Status", "Email", "Open_count", "Last_Open", "From", "Subject",
+                "Timestamp", "Status", "Email", "Open_count", "Last_Open", "From",
                 "Followup1_Sent", "Opened_FW1", "Followup2_Sent", "Opened_FW2", "Followup3_Sent", "Opened_FW3"
             ])
     except Exception as e:
@@ -105,7 +97,7 @@ def track(path):
 
     if email and sender:
         try:
-            update_sheet(sheet, email, sender, timestamp, stage=stage, subject=subject)
+            update_sheet(sheet, email, sender, timestamp, stage=stage)
             print(f" Tracked: {email} from {sender} (stage: {stage})")
         except Exception as err:
             print(f" Sheet update failed: {err}")
