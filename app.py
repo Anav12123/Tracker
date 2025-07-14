@@ -14,18 +14,24 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-DEFAULT_SHEET_NAME = "EmailTRACKV2" 
+DEFAULT_SHEET_NAME = "EmailTRACKV2"
 
 # Load credentials from Render environment variable
 creds_info = json.loads(os.environ["GOOGLE_CREDS_JSON"])
 creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 client = gspread.authorize(creds)
 
-
-def update_sheet(sheet, email, sender, timestamp, stage=None):
+def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
     headers = sheet.row_values(1)
     col_map = {key.strip(): idx for idx, key in enumerate(headers)}
-    data = sheet.get_all_values()[1:]  # Exclude header row
+    
+    # Add "Subject" column if missing
+    if "Subject" not in col_map:
+        sheet.insert_cols([["Subject"]], col=len(headers) + 1)
+        headers = sheet.row_values(1)
+        col_map = {key.strip(): idx for idx, key in enumerate(headers)}
+    
+    data = sheet.get_all_values()[1:]  # Skip header
     found = False
 
     for i, row in enumerate(data):
@@ -36,10 +42,12 @@ def update_sheet(sheet, email, sender, timestamp, stage=None):
             sheet.update_cell(row_num, col_map["Open_count"] + 1, current_count)
             sheet.update_cell(row_num, col_map["Last_Open"] + 1, timestamp)
             sheet.update_cell(row_num, col_map["Status"] + 1, "OPENED")
+
             if "From" in col_map:
                 sheet.update_cell(row_num, col_map["From"] + 1, sender)
+            if "Subject" in col_map and subject:
+                sheet.update_cell(row_num, col_map["Subject"] + 1, subject)
 
-            #  Mark open with YES instead of timestamp
             if stage:
                 open_col = {
                     "fw_1": "Opened_FW1",
@@ -61,6 +69,8 @@ def update_sheet(sheet, email, sender, timestamp, stage=None):
         new_row[col_map["Last_Open"]] = timestamp
         if "From" in col_map:
             new_row[col_map["From"]] = sender
+        if "Subject" in col_map and subject:
+            new_row[col_map["Subject"]] = subject
         if stage:
             open_col = {
                 "fw_1": "Opened_FW1",
@@ -74,7 +84,7 @@ def update_sheet(sheet, email, sender, timestamp, stage=None):
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def track(path):
-    email = sender = stage = None
+    email = sender = stage = subject = None
     timestamp = str(datetime.now())
 
     try:
@@ -82,14 +92,17 @@ def track(path):
         padded = token + '=' * (-len(token) % 4)
         decoded = base64.urlsafe_b64decode(padded.encode())
         metadata = json.loads(decoded)
-        email = metadata.get("metadata", {}).get("email")
-        sender = metadata.get("metadata", {}).get("sender")
-        stage  = metadata.get("metadata", {}).get("stage")
-        sheet_name = metadata.get("metadata", {}).get("sheet", DEFAULT_SHEET_NAME)
+        meta = metadata.get("metadata", {})
+        email = meta.get("email")
+        sender = meta.get("sender")
+        stage = meta.get("stage")
+        subject = meta.get("subject")  # 🔥 Extract subject here
+        sheet_name = meta.get("sheet", DEFAULT_SHEET_NAME)
         sheet = client.open(sheet_name).sheet1
+
         if not sheet.get_all_values():
             sheet.append_row([
-                "Timestamp", "Status", "Email", "Open_count", "Last_Open", "From",
+                "Timestamp", "Status", "Email", "Open_count", "Last_Open", "From", "Subject",
                 "Followup1_Sent", "Opened_FW1", "Followup2_Sent", "Opened_FW2", "Followup3_Sent", "Opened_FW3"
             ])
     except Exception as e:
@@ -97,13 +110,13 @@ def track(path):
 
     if email and sender:
         try:
-            update_sheet(sheet, email, sender, timestamp, stage=stage)
-            print(f" Tracked: {email} from {sender} (stage: {stage})")
+            update_sheet(sheet, email, sender, timestamp, stage=stage, subject=subject)
+            print(f" Tracked: {email} from {sender} (stage: {stage}, subject: {subject})")
         except Exception as err:
             print(f" Sheet update failed: {err}")
 
         with open("opens.log", "a") as log:
-            log.write(f"{timestamp} - OPENED: {email} (from {sender}, stage: {stage})\n")
+            log.write(f"{timestamp} - OPENED: {email} (from {sender}, subject: {subject}, stage: {stage})\n")
 
     return send_file("pixel.png", mimetype="image/png")
 
