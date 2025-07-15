@@ -5,6 +5,7 @@ import json
 import os
 import gspread
 from google.oauth2.service_account import Credentials
+import pytz
 
 app = Flask(__name__)
 
@@ -85,7 +86,9 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
 @app.route('/<path:path>')
 def track(path):
     email = sender = stage = subject = None
-    timestamp = str(datetime.now())
+    IST = pytz.timezone("Asia/Kolkata")
+    timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
 
     try:
         token = path.split('.')[0]
