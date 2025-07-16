@@ -40,7 +40,7 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
         headers = sheet.row_values(1)
         col_map = {key.strip(): idx for idx, key in enumerate(headers)}
 
-    data = sheet.get_all_values()[1:]  # Skip header
+    data = sheet.get_all_values()[1:]
     found = False
 
     for i, row in enumerate(data):
@@ -89,7 +89,7 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
                 new_row[col_map[open_col]] = "YES"
         sheet.append_row(new_row)
 
-# === Tracking Endpoint ===
+# === Tracking Pixel Endpoint ===
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def track(path):
@@ -115,12 +115,6 @@ def track(path):
         subject = meta.get("subject")
         sheet_name = meta.get("sheet", DEFAULT_SHEET_NAME)
         sheet = client.open(sheet_name).sheet1
-
-        if not sheet.get_all_values():
-            sheet.append_row([
-                "Timestamp", "Status", "Email", "Open_count", "Last_Open", "From", "Subject",
-                "Followup1_Sent", "Opened_FW1", "Followup2_Sent", "Opened_FW2", "Followup3_Sent", "Opened_FW3"
-            ])
     except Exception as e:
         print(f"⚠ Invalid metadata: {e}")
 
@@ -138,12 +132,53 @@ def track(path):
             log.write(f"{timestamp} - {confidence.upper()} OPEN: {email} "
                       f"(IP: {ip}, UA: {user_agent}, sender: {sender}, subject: {subject}, stage: {stage})\n")
 
-    # Return 1x1 transparent GIF
     gif_bytes = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xFF\xFF\xFF!' \
                 b'\xF9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01' \
                 b'\x00\x00\x02\x02L\x01\x00;'
     return send_file(io.BytesIO(gif_bytes), mimetype="image/gif")
 
+# === SendGrid Webhook Endpoint ===
+@app.route("/sendgrid/events", methods=["POST"])
+def sendgrid_events():
+    IST = pytz.timezone("Asia/Kolkata")
+    try:
+        events = request.get_json(force=True)
+        sheet = client.open(DEFAULT_SHEET_NAME).sheet1
+        headers = sheet.row_values(1)
+        col_map = {key.strip(): idx for idx, key in enumerate(headers)}
+
+        for event in events:
+            if event.get("event") == "open":
+                email = event.get("email")
+                ua = event.get("useragent", "")
+                if is_bot(ua):
+                    print(f"⚠ Ignored bot open from: {email}")
+                    continue
+
+                timestamp = datetime.fromtimestamp(event.get("timestamp")).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+                data = sheet.get_all_values()[1:]
+                for i, row in enumerate(data):
+                    if row[col_map["Email"]].strip().lower() == email.strip().lower():
+                        row_num = i + 2
+                        if "OPENED" in col_map:
+                            sheet.update_cell(row_num, col_map["OPENED"] + 1, "YES")
+                        else:
+                            sheet.insert_cols([["OPENED"]], col=len(headers) + 1)
+                            sheet.update_cell(row_num, len(headers) + 1, "YES")
+
+                        if "Last_Open" in col_map:
+                            sheet.update_cell(row_num, col_map["Last_Open"] + 1, timestamp)
+
+                        print(f"📨 Marked OPENED for {email} via SendGrid webhook")
+                        break
+        return "OK", 200
+
+    except Exception as e:
+        print(f"❌ Error in SendGrid webhook: {e}")
+        return "Error", 500
+
+# === Health Check ===
 @app.route('/health')
 def health():
     return "Tracker is live and healthy."
