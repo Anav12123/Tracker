@@ -39,16 +39,14 @@ def is_known_bot(ua: str) -> bool:
 def is_image_proxy(req) -> bool:
     ua = req.headers.get("User-Agent", "").lower()
     via = req.headers.get("Via", "").lower()
-    # Gmail proxy
-    if "googleimageproxy" in ua or "apis-google" in ua:
-        return True
-    # Outlook preview
-    if "ms-office" in ua or "office-http-client" in ua:
-        return True
-    # Gmail adds a Via header
-    if "google" in via and "mail" in via:
-        return True
-    return False
+    return any([
+        "googleimageproxy" in ua,
+        "googleusercontent" in ua,
+        "apis-google" in ua,
+        "gmail" in ua,
+        "google" in via and "mail" in via,
+        "google" in ua and "mail" in ua,
+    ])
 
 def is_bot_request(req) -> bool:
     ua = req.headers.get("User-Agent", "")
@@ -56,12 +54,12 @@ def is_bot_request(req) -> bool:
 
 # === Spreadsheet Updater ===
 
-def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
+def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None, human=False):
     headers = sheet.row_values(1)
     col_map = {h: i for i, h in enumerate(headers)}
 
-    # Auto-create required cols if missing
-    for col in ["Timestamp","Status","Email","Open_count","Last_Open","From","Subject"]:
+    # Ensure all required columns exist
+    for col in ["Timestamp", "Status", "Email", "Open_count", "Last_Open", "From", "Subject", "Verified_Human"]:
         if col not in col_map:
             sheet.insert_cols([[col]], col=len(headers)+1)
             headers = sheet.row_values(1)
@@ -70,85 +68,106 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
     rows = sheet.get_all_values()[1:]
     for idx, row in enumerate(rows, start=2):
         if row[col_map["Email"]].strip().lower() == email.strip().lower():
-            # already recorded → update
             count = int(row[col_map["Open_count"]] or "0") + 1
             sheet.update_cell(idx, col_map["Open_count"]+1, count)
             sheet.update_cell(idx, col_map["Last_Open"]+1, timestamp)
             sheet.update_cell(idx, col_map["Status"]+1, "OPENED")
             sheet.update_cell(idx, col_map["From"]+1, sender)
             sheet.update_cell(idx, col_map["Subject"]+1, subject or "")
+            if human:
+                sheet.update_cell(idx, col_map["Verified_Human"]+1, "YES")
             if stage:
                 stage_col = f"Opened_{stage.upper()}"
                 if stage_col in col_map:
                     sheet.update_cell(idx, col_map[stage_col]+1, "YES")
             return
 
-    # not found → append new
     new_row = [""] * len(headers)
-    new_row[col_map["Timestamp"]] = timestamp
-    new_row[col_map["Status"]]    = "OPENED"
-    new_row[col_map["Email"]]     = email
-    new_row[col_map["Open_count"]]= "1"
-    new_row[col_map["Last_Open"]] = timestamp
-    new_row[col_map["From"]]      = sender
-    new_row[col_map["Subject"]]   = subject or ""
+    new_row[col_map["Timestamp"]]     = timestamp
+    new_row[col_map["Status"]]        = "OPENED"
+    new_row[col_map["Email"]]         = email
+    new_row[col_map["Open_count"]]    = "1"
+    new_row[col_map["Last_Open"]]     = timestamp
+    new_row[col_map["From"]]          = sender
+    new_row[col_map["Subject"]]       = subject or ""
+    new_row[col_map["Verified_Human"]]= "YES" if human else ""
     if stage:
         stage_col = f"Opened_{stage.upper()}"
         if stage_col in col_map:
             new_row[col_map[stage_col]] = "YES"
     sheet.append_row(new_row)
 
-# === Tracking Pixel Endpoint ===
-
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def track(path):
-    # ignore bots & proxies
-    if is_bot_request(request):
-        return send_file(io.BytesIO(b''), mimetype="image/gif")
-
-    # parse metadata
-    IST_NOW = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        token  = path.split('.')[0]
-        padded = token + '=' * (-len(token) % 4)
-        meta   = json.loads(base64.urlsafe_b64decode(padded.encode()))
-        info   = meta.get("metadata", {})
-        email  = info.get("email")
-        sender = info.get("sender")
-        stage  = info.get("stage")
-        subject= info.get("subject")
-        sheet_name = info.get("sheet", DEFAULT_SHEET_NAME)
-        sheet  = client.open(sheet_name).sheet1
-        if not sheet.get_all_values():
-            # create header row
-            sheet.append_row([
-                "Timestamp","Status","Email","Open_count","Last_Open","From","Subject",
-                "Followup1_Sent","Opened_FW1","Followup2_Sent","Opened_FW2","Followup3_Sent","Opened_FW3"
-            ])
-    except Exception as e:
-        print("⚠ Invalid metadata:", e)
-        return send_file(io.BytesIO(b''), mimetype="image/gif")
-
-    # record the open
-    if email and sender:
-        try:
-            update_sheet(sheet, email, sender, IST_NOW, stage, subject)
-            print(f"✅ Tracked open: {email} from {sender}")
-        except Exception as err:
-            print("❌ Sheet update failed:", err)
-
-    # 1×1 transparent GIF
-    gif = (
+# === 1x1 Pixel (transparent GIF)
+def blank_pixel():
+    return send_file(io.BytesIO(
         b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00"
         b"\xFF\xFF\xFF!\xF9\x04\x01\x00\x00\x00\x00,"
         b"\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02"
         b"L\x01\x00;"
-    )
-    return send_file(io.BytesIO(gif), mimetype="image/gif")
+    ), mimetype="image/gif")
+
+# === Primary Tracking Pixel (could be Gmail proxy)
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def track(path):
+    # === FILTER bots & proxies immediately
+    if is_bot_request(request):
+        print("🚫 Blocked proxy/bot UA:", request.headers.get("User-Agent", ""))
+        return blank_pixel()
+
+    IST_NOW = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        token = path.split('.')[0]
+        padded = token + '=' * (-len(token) % 4)
+        meta = json.loads(base64.urlsafe_b64decode(padded.encode()))
+        info = meta.get("metadata", {})
+        email = info.get("email")
+        sender = info.get("sender")
+        stage = info.get("stage")
+        subject = info.get("subject")
+        sheet_name = info.get("sheet", DEFAULT_SHEET_NAME)
+        sheet = client.open(sheet_name).sheet1
+        if not sheet.get_all_values():
+            sheet.append_row([
+                "Timestamp", "Status", "Email", "Open_count", "Last_Open", "From", "Subject",
+                "Followup1_Sent", "Opened_FW1", "Followup2_Sent", "Opened_FW2", "Followup3_Sent", "Opened_FW3",
+                "Verified_Human"
+            ])
+    except Exception as e:
+        print("⚠ Invalid metadata:", e)
+        return blank_pixel()
+
+    if email and sender:
+        try:
+            update_sheet(sheet, email, sender, IST_NOW, stage, subject, human=False)
+            print(f" Tracked proxy/initial open: {email} from {sender}")
+        except Exception as err:
+            print(" Sheet update failed:", err)
+
+    return blank_pixel()
+
+# === Human Verified Endpoint ===
+@app.route('/human/<token>')
+def human_open(token):
+    IST_NOW = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        padded = token + '=' * (-len(token) % 4)
+        meta = json.loads(base64.urlsafe_b64decode(padded.encode()))
+        info = meta.get("metadata", {})
+        email = info.get("email")
+        sender = info.get("sender")
+        stage = info.get("stage")
+        subject = info.get("subject")
+        sheet_name = info.get("sheet", DEFAULT_SHEET_NAME)
+        sheet = client.open(sheet_name).sheet1
+        update_sheet(sheet, email, sender, IST_NOW, stage, subject, human=True)
+        print(f" Verified human open: {email}")
+    except Exception as e:
+        print(" Failed to process human open:", e)
+
+    return blank_pixel()
 
 # === Health Check ===
-
 @app.route('/health')
 def health():
     return "Tracker is live and healthy."
