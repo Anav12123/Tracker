@@ -1,209 +1,153 @@
 from flask import Flask, request, send_file
 from datetime import datetime
-import base64, json, os, io, pytz
-import ipaddress
+import base64
+import json
+import os
 import gspread
 from google.oauth2.service_account import Credentials
+import pytz
+import io
 
 app = Flask(__name__)
 
-# === Config & Google Sheets Setup ===
-SCOPES            = ["https://www.googleapis.com/auth/spreadsheets",
-                     "https://www.googleapis.com/auth/drive"]
-DEFAULT_SHEET     = "EmailTRACKV2"
-IST               = pytz.timezone("Asia/Kolkata")
-GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
-
-creds_info = json.loads(GOOGLE_CREDS_JSON)
-creds      = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-client     = gspread.authorize(creds)
-
-# === Google’s public IP blocks (simplified example) ===
-GOOGLE_NETBLOCKS = [
-    "64.18.0.0/20",    # Gmail image proxy  
-    "66.102.0.0/20",   # googleusercontent.com
-    "66.249.80.0/20",
-    "72.14.192.0/18",
-    "74.125.0.0/16",
-    "209.85.128.0/17"
+# === Google Sheets Setup ===
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
 ]
-# Pre-parse
-GOOGLE_NETWORKS = [ipaddress.ip_network(cidr) for cidr in GOOGLE_NETBLOCKS]
+DEFAULT_SHEET_NAME = "EmailTRACKV2"
 
-def ip_is_google(ip_str):
-    try:
-        ip = ipaddress.ip_address(ip_str)
-        return any(ip in net for net in GOOGLE_NETWORKS)
-    except Exception:
-        return False
+# Load credentials from Render environment variable
+creds_info = json.loads(os.environ["GOOGLE_CREDS_JSON"])
+creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+client = gspread.authorize(creds)
 
-# === Bot & Proxy Filters ===
-def is_known_bot(ua: str) -> bool:
-    ua = ua.lower()
-    bots = [
-        "bot", "crawler", "spider", "fetch", "slurp", "preview",
-        "scanner", "monitor", "pingdom", "python-requests",
-        "curl", "wget", "msnbot", "bingbot", "facebookexternalhit",
-        "yahoo", "ia_archiver", "phantomjs", "headless",
-        "speedtest", "discordbot"
+# === Bot Detection Helper ===
+def is_bot(user_agent):
+    KNOWN_BOTS = [
+        "google", "proxy", "crawler", "scanner", "preview", "fetch", "urlcheck",
+        "defense", "proofpoint", "barracuda", "mimecast", "outlook", "microsoft"
     ]
-    return any(tok in ua for tok in bots)
-
-def is_image_proxy(req) -> bool:
-    ua  = req.headers.get("User-Agent", "").lower()
-    via = req.headers.get("Via", "").lower()
-    referer = req.headers.get("Referer", "").lower()
-    xfwd = req.headers.get("X-Forwarded-For", "")
-
-    # Common Gmail proxy tokens
-    proxy_signatures = [
-        "googleimageproxy", "gmailimageproxy", "googlewebrender",
-        "apis-google", "googlewebpreview", "google",
-        "camo.githubusercontent",  # GitHub’s image proxy
-    ]
-    # 1) UA hints
-    if any(tok in ua for tok in proxy_signatures):
-        return True
-
-    # 2) Via header
-    if "google" in via and "mail" in via:
-        return True
-
-    # 3) Referer coming from google
-    if referer.startswith("https://mail.google.com"):
-        return True
-
-    # 4) Client IP belongs to known Google netblocks
-    ip = req.headers.get("X-Forwarded-For", req.remote_addr).split(",")[0].strip()
-    if ip_is_google(ip):
-        return True
-
-    return False
-
-def is_bot_request(req) -> bool:
-    ua = req.headers.get("User-Agent", "")
-    return is_known_bot(ua) or is_image_proxy(req)
+    return any(bot in user_agent.lower() for bot in KNOWN_BOTS)
 
 # === Sheet Updater ===
-def update_sheet(sheet, email, sender, ts, stage=None, subject=None, human=False):
+def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
     headers = sheet.row_values(1)
-    col_map = {h: i for i, h in enumerate(headers)}
+    col_map = {key.strip(): idx for idx, key in enumerate(headers)}
 
-    # Ensure required cols
-    needed = [
-      "Timestamp","Status","Email","Open_count","Last_Open",
-      "From","Subject","Verified_Human"
-    ]
-    for col in needed:
-        if col not in col_map:
-            sheet.insert_cols([[col]], col=len(headers)+1)
-            headers = sheet.row_values(1)
-            col_map = {h: i for i, h in enumerate(headers)}
+    if "Subject" not in col_map:
+        sheet.insert_cols([["Subject"]], col=len(headers) + 1)
+        headers = sheet.row_values(1)
+        col_map = {key.strip(): idx for idx, key in enumerate(headers)}
 
-    data = sheet.get_all_values()[1:]
-    for r, row in enumerate(data, start=2):
-        if row[col_map["Email"]].strip().lower() == email.lower():
-            # Update existing
-            count = int(row[col_map["Open_count"]] or "0") + 1
-            sheet.update_cell(r, col_map["Open_count"]+1, count)
-            sheet.update_cell(r, col_map["Last_Open"]+1, ts)
-            sheet.update_cell(r, col_map["Status"]+1, "OPENED")
-            sheet.update_cell(r, col_map["From"]+1, sender)
-            sheet.update_cell(r, col_map["Subject"]+1, subject or "")
-            if human:
-                sheet.update_cell(r, col_map["Verified_Human"]+1, "YES")
+    data = sheet.get_all_values()[1:]  # Skip header
+    found = False
+
+    for i, row in enumerate(data):
+        if row[col_map["Email"]] == email:
+            row_num = i + 2
+            current_count = int(row[col_map["Open_count"]] or "0") + 1
+            sheet.update_cell(row_num, col_map["Open_count"] + 1, current_count)
+            sheet.update_cell(row_num, col_map["Last_Open"] + 1, timestamp)
+            sheet.update_cell(row_num, col_map["Status"] + 1, "OPENED")
+
+            if "From" in col_map:
+                sheet.update_cell(row_num, col_map["From"] + 1, sender)
+            if "Subject" in col_map and subject:
+                sheet.update_cell(row_num, col_map["Subject"] + 1, subject)
+
             if stage:
-                sc = f"Opened_{stage.upper()}"
-                if sc in col_map:
-                    sheet.update_cell(r, col_map[sc]+1, "YES")
-            return
+                open_col = {
+                    "fw_1": "Opened_FW1",
+                    "fw_2": "Opened_FW2",
+                    "fw_3": "Opened_FW3"
+                }.get(stage)
+                if open_col and open_col in col_map:
+                    sheet.update_cell(row_num, col_map[open_col] + 1, "YES")
 
-    # Append new row
-    row = [""] * len(headers)
-    row[col_map["Timestamp"]]      = ts
-    row[col_map["Status"]]         = "OPENED"
-    row[col_map["Email"]]          = email
-    row[col_map["Open_count"]]     = "1"
-    row[col_map["Last_Open"]]      = ts
-    row[col_map["From"]]           = sender
-    row[col_map["Subject"]]        = subject or ""
-    row[col_map["Verified_Human"]] = "YES" if human else ""
-    if stage and f"Opened_{stage.upper()}" in col_map:
-        row[col_map[f"Opened_{stage.upper()}"]] = "YES"
-    sheet.append_row(row)
+            found = True
+            break
 
-# === Transparent GIF ===
-def blank_pixel():
-    return send_file(io.BytesIO(
-        b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00"
-        b"\xFF\xFF\xFF!\xF9\x04\x01\x00\x00\x00\x00,"
-        b"\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02"
-        b"L\x01\x00;"
-    ), mimetype="image/gif")
+    if not found:
+        new_row = ["" for _ in headers]
+        new_row[col_map["Timestamp"]] = timestamp
+        new_row[col_map["Status"]] = "OPENED"
+        new_row[col_map["Email"]] = email
+        new_row[col_map["Open_count"]] = 1
+        new_row[col_map["Last_Open"]] = timestamp
+        if "From" in col_map:
+            new_row[col_map["From"]] = sender
+        if "Subject" in col_map and subject:
+            new_row[col_map["Subject"]] = subject
+        if stage:
+            open_col = {
+                "fw_1": "Opened_FW1",
+                "fw_2": "Opened_FW2",
+                "fw_3": "Opened_FW3"
+            }.get(stage)
+            if open_col and open_col in col_map:
+                new_row[col_map[open_col]] = "YES"
+        sheet.append_row(new_row)
 
-# === Pixel Endpoint ===
+# === Tracking Endpoint ===
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def track(path):
-    # 1) Drop every bot/proxy immediately
-    if is_bot_request(request):
-        return blank_pixel()
+    email = sender = stage = subject = None
+    IST = pytz.timezone("Asia/Kolkata")
+    timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
-    # 2) Parse metadata
-    IST_NOW = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    user_agent = request.headers.get("User-Agent", "").lower()
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    confidence = "High"
+    if is_bot(user_agent):
+        confidence = "Low"
+
     try:
         token = path.split('.')[0]
-        padded = token + "=" * (-len(token) % 4)
-        meta = json.loads(base64.urlsafe_b64decode(padded))
-        info = meta.get("metadata", {})
-        email, sender = info.get("email"), info.get("sender")
-        stage, subject = info.get("stage"), info.get("subject")
-        sheet_name = info.get("sheet", DEFAULT_SHEET_NAME)
+        padded = token + '=' * (-len(token) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode())
+        metadata = json.loads(decoded)
+        meta = metadata.get("metadata", {})
+        email = meta.get("email")
+        sender = meta.get("sender")
+        stage = meta.get("stage")
+        subject = meta.get("subject")
+        sheet_name = meta.get("sheet", DEFAULT_SHEET_NAME)
         sheet = client.open(sheet_name).sheet1
 
-        # Ensure header row
         if not sheet.get_all_values():
             sheet.append_row([
-                "Timestamp","Status","Email","Open_count","Last_Open","From","Subject",
-                "Followup1_Sent","Opened_FW1","Followup2_Sent","Opened_FW2",
-                "Followup3_Sent","Opened_FW3","Verified_Human"
+                "Timestamp", "Status", "Email", "Open_count", "Last_Open", "From", "Subject",
+                "Followup1_Sent", "Opened_FW1", "Followup2_Sent", "Opened_FW2", "Followup3_Sent", "Opened_FW3"
             ])
     except Exception as e:
-        print("⚠ Invalid metadata:", e)
-        return blank_pixel()
+        print(f"⚠ Invalid metadata: {e}")
 
-    # 3) Record initial open (unverified human)
     if email and sender:
         try:
-            update_sheet(sheet, email, sender, IST_NOW, stage, subject, human=False)
+            if confidence == "High":
+                update_sheet(sheet, email, sender, timestamp, stage=stage, subject=subject)
+                print(f"✅ Tracked: {email} from {sender} (stage: {stage}, subject: {subject})")
+            else:
+                print(f"⚠️ Ignored bot open for: {email} — UA: {user_agent}")
         except Exception as err:
-            print("❌ Sheet update failed:", err)
+            print(f"❌ Sheet update failed: {err}")
 
-    return blank_pixel()
+        with open("opens.log", "a") as log:
+            log.write(f"{timestamp} - {confidence.upper()} OPEN: {email} "
+                      f"(IP: {ip}, UA: {user_agent}, sender: {sender}, subject: {subject}, stage: {stage})\n")
 
-# === Human Verified Link ===
-@app.route('/human/<token>')
-def human_open(token):
-    IST_NOW = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        padded = token + "=" * (-len(token) % 4)
-        meta   = json.loads(base64.urlsafe_b64decode(padded))
-        info   = meta.get("metadata", {})
-        email, sender = info.get("email"), info.get("sender")
-        stage, subject = info.get("stage"), info.get("subject")
-        sheet_name = info.get("sheet", DEFAULT_SHEET_NAME)
-        sheet = client.open(sheet_name).sheet1
+    # Return 1x1 transparent GIF
+    gif_bytes = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xFF\xFF\xFF!' \
+                b'\xF9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01' \
+                b'\x00\x00\x02\x02L\x01\x00;'
+    return send_file(io.BytesIO(gif_bytes), mimetype="image/gif")
 
-        update_sheet(sheet, email, sender, IST_NOW, stage, subject, human=True)
-    except Exception as e:
-        print("❌ Human open failed:", e)
-
-    return blank_pixel()
-
-# === Health Check ===
 @app.route('/health')
 def health():
     return "Tracker is live and healthy."
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
