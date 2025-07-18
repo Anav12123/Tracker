@@ -3,146 +3,155 @@ from datetime import datetime
 import base64
 import json
 import os
+import io
+import pytz
 import gspread
 from google.oauth2.service_account import Credentials
-import pytz
-import io
 
 app = Flask(__name__)
 
 # === Google Sheets Setup ===
-SCOPES = [
+SCOPES             = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 DEFAULT_SHEET_NAME = "EmailTRACKV2"
+IST               = pytz.timezone("Asia/Kolkata")
 
-# Load credentials from Render environment variable
 creds_info = json.loads(os.environ["GOOGLE_CREDS_JSON"])
-creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-client = gspread.authorize(creds)
+creds      = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+client     = gspread.authorize(creds)
 
-# === Bot Detection Helper ===
-def is_bot(user_agent):
-    KNOWN_BOTS = [
-        "google", "proxy", "crawler", "scanner", "preview", "fetch", "urlcheck",
-        "defense", "proofpoint", "barracuda", "mimecast", "outlook", "microsoft"
+# === Bot & Gmail-Proxy Detection ===
+def is_bot(ua: str) -> bool:
+    ua = ua.lower()
+    # your existing filters plus curl/wget etc
+    BOT_KEYWORDS = [
+        "bot", "crawler", "scanner", "proofpoint", "mimecast",
+        "curl", "wget", "python-requests", "outlook", "microsoft"
     ]
-    return any(bot in user_agent.lower() for bot in KNOWN_BOTS)
+    return any(tok in ua for tok in BOT_KEYWORDS)
+
+def is_gmail_proxy(req) -> bool:
+    """Detect Gmail’s automatic image proxy via UA, Via or Referer."""
+    ua     = req.headers.get("User-Agent", "").lower()
+    via    = req.headers.get("Via", "").lower()
+    refer  = req.headers.get("Referer", "").lower()
+
+    # Gmail/Image proxy signatures
+    if "googleimageproxy" in ua:               # new Gmail UA
+        return True
+    if "apis-google" in ua:                    # another Gmail UA
+        return True
+    if "googlewebrender" in ua:                # Gmail mobile preview
+        return True
+    if refer.startswith("https://mail.google.com"):
+        return True
+    if "google" in via and "mail" in via:
+        return True
+
+    return False
+
+def is_bot_request(req) -> bool:
+    ua = req.headers.get("User-Agent", "")
+    return is_bot(ua) or is_gmail_proxy(req)
+
 
 # === Sheet Updater ===
 def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
     headers = sheet.row_values(1)
-    col_map = {key.strip(): idx for idx, key in enumerate(headers)}
+    col_map = {h: i for i, h in enumerate(headers)}
 
-    if "Subject" not in col_map:
-        sheet.insert_cols([["Subject"]], col=len(headers) + 1)
-        headers = sheet.row_values(1)
-        col_map = {key.strip(): idx for idx, key in enumerate(headers)}
+    # ensure essential columns exist
+    for col in ["Timestamp","Status","Email","Open_count","Last_Open","From","Subject"]:
+        if col not in col_map:
+            sheet.insert_cols([[col]], col=len(headers)+1)
+            headers = sheet.row_values(1)
+            col_map = {h: i for i, h in enumerate(headers)}
 
-    data = sheet.get_all_values()[1:]  # Skip header
-    found = False
-
-    for i, row in enumerate(data):
-        if row[col_map["Email"]] == email:
-            row_num = i + 2
-            current_count = int(row[col_map["Open_count"]] or "0") + 1
-            sheet.update_cell(row_num, col_map["Open_count"] + 1, current_count)
-            sheet.update_cell(row_num, col_map["Last_Open"] + 1, timestamp)
-            sheet.update_cell(row_num, col_map["Status"] + 1, "OPENED")
-
-            if "From" in col_map:
-                sheet.update_cell(row_num, col_map["From"] + 1, sender)
-            if "Subject" in col_map and subject:
-                sheet.update_cell(row_num, col_map["Subject"] + 1, subject)
-
+    rows = sheet.get_all_values()[1:]
+    for r, row in enumerate(rows, start=2):
+        if row[col_map["Email"]].strip().lower() == email.lower():
+            # update existing
+            count = int(row[col_map["Open_count"]] or "0") + 1
+            sheet.update_cell(r, col_map["Open_count"]+1, count)
+            sheet.update_cell(r, col_map["Last_Open"]+1, timestamp)
+            sheet.update_cell(r, col_map["Status"]+1, "OPENED")
+            sheet.update_cell(r, col_map["From"]+1, sender)
+            sheet.update_cell(r, col_map["Subject"]+1, subject or "")
             if stage:
-                open_col = {
-                    "fw_1": "Opened_FW1",
-                    "fw_2": "Opened_FW2",
-                    "fw_3": "Opened_FW3"
-                }.get(stage)
-                if open_col and open_col in col_map:
-                    sheet.update_cell(row_num, col_map[open_col] + 1, "YES")
+                stage_col = f"Opened_{stage.upper()}"
+                if stage_col in col_map:
+                    sheet.update_cell(r, col_map[stage_col]+1, "YES")
+            return
 
-            found = True
-            break
+    # append new row
+    new_row = [""] * len(headers)
+    new_row[col_map["Timestamp"]]   = timestamp
+    new_row[col_map["Status"]]      = "OPENED"
+    new_row[col_map["Email"]]       = email
+    new_row[col_map["Open_count"]]  = "1"
+    new_row[col_map["Last_Open"]]   = timestamp
+    new_row[col_map["From"]]        = sender
+    new_row[col_map["Subject"]]     = subject or ""
+    if stage:
+        stage_col = f"Opened_{stage.upper()}"
+        if stage_col in col_map:
+            new_row[col_map[stage_col]] = "YES"
+    sheet.append_row(new_row)
 
-    if not found:
-        new_row = ["" for _ in headers]
-        new_row[col_map["Timestamp"]] = timestamp
-        new_row[col_map["Status"]] = "OPENED"
-        new_row[col_map["Email"]] = email
-        new_row[col_map["Open_count"]] = 1
-        new_row[col_map["Last_Open"]] = timestamp
-        if "From" in col_map:
-            new_row[col_map["From"]] = sender
-        if "Subject" in col_map and subject:
-            new_row[col_map["Subject"]] = subject
-        if stage:
-            open_col = {
-                "fw_1": "Opened_FW1",
-                "fw_2": "Opened_FW2",
-                "fw_3": "Opened_FW3"
-            }.get(stage)
-            if open_col and open_col in col_map:
-                new_row[col_map[open_col]] = "YES"
-        sheet.append_row(new_row)
+# === Transparent GIF BYTES ===
+GIF_BYTES = (
+    b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00"
+    b"\xFF\xFF\xFF!\xF9\x04\x01\x00\x00\x00\x00,"
+    b"\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02"
+    b"L\x01\x00;"
+)
 
 # === Tracking Endpoint ===
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def track(path):
-    email = sender = stage = subject = None
-    IST = pytz.timezone("Asia/Kolkata")
-    timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    # 1) Immediately drop any bot / proxy hit
+    if is_bot_request(request):
+        return send_file(io.BytesIO(GIF_BYTES), mimetype="image/gif")
 
-    user_agent = request.headers.get("User-Agent", "").lower()
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    confidence = "High"
-    if is_bot(user_agent):
-        confidence = "Low"
-
+    # 2) Parse metadata and ensure sheet exists
+    IST_NOW = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     try:
-        token = path.split('.')[0]
-        padded = token + '=' * (-len(token) % 4)
-        decoded = base64.urlsafe_b64decode(padded.encode())
-        metadata = json.loads(decoded)
-        meta = metadata.get("metadata", {})
-        email = meta.get("email")
-        sender = meta.get("sender")
-        stage = meta.get("stage")
-        subject = meta.get("subject")
-        sheet_name = meta.get("sheet", DEFAULT_SHEET_NAME)
-        sheet = client.open(sheet_name).sheet1
+        token     = path.split('.')[0]
+        padded    = token + '=' * (-len(token) % 4)
+        metadata  = json.loads(base64.urlsafe_b64decode(padded.encode()))
+        info      = metadata.get("metadata", {})
+        email     = info.get("email")
+        sender    = info.get("sender")
+        stage     = info.get("stage")
+        subject   = info.get("subject")
+        sheet_name= info.get("sheet", DEFAULT_SHEET_NAME)
+        sheet     = client.open(sheet_name).sheet1
 
+        # add header row if missing
         if not sheet.get_all_values():
             sheet.append_row([
-                "Timestamp", "Status", "Email", "Open_count", "Last_Open", "From", "Subject",
-                "Followup1_Sent", "Opened_FW1", "Followup2_Sent", "Opened_FW2", "Followup3_Sent", "Opened_FW3"
+                "Timestamp","Status","Email","Open_count","Last_Open",
+                "From","Subject","Followup1_Sent","Opened_FW1",
+                "Followup2_Sent","Opened_FW2","Followup3_Sent","Opened_FW3"
             ])
     except Exception as e:
-        print(f"⚠ Invalid metadata: {e}")
+        print("⚠ Invalid metadata:", e)
+        return send_file(io.BytesIO(GIF_BYTES), mimetype="image/gif")
 
+    # 3) Record only real human opens
     if email and sender:
         try:
-            if confidence == "High":
-                update_sheet(sheet, email, sender, timestamp, stage=stage, subject=subject)
-                print(f"✅ Tracked: {email} from {sender} (stage: {stage}, subject: {subject})")
-            else:
-                print(f"⚠️ Ignored bot open for: {email} — UA: {user_agent}")
+            update_sheet(sheet, email, sender, IST_NOW, stage, subject)
+            print(f"✅ Tracked human open: {email}")
         except Exception as err:
-            print(f"❌ Sheet update failed: {err}")
+            print("❌ Sheet update failed:", err)
 
-        with open("opens.log", "a") as log:
-            log.write(f"{timestamp} - {confidence.upper()} OPEN: {email} "
-                      f"(IP: {ip}, UA: {user_agent}, sender: {sender}, subject: {subject}, stage: {stage})\n")
+    # 4) Return the transparent GIF
+    return send_file(io.BytesIO(GIF_BYTES), mimetype="image/gif")
 
-    # Return 1x1 transparent GIF
-    gif_bytes = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xFF\xFF\xFF!' \
-                b'\xF9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01' \
-                b'\x00\x00\x02\x02L\x01\x00;'
-    return send_file(io.BytesIO(gif_bytes), mimetype="image/gif")
 
 @app.route('/health')
 def health():
