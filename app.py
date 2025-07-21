@@ -17,6 +17,7 @@ SCOPES = [
 ]
 DEFAULT_SHEET_NAME = "EmailTRACKV2"
 
+# Load credentials from Render environment variable
 creds_info = json.loads(os.environ["GOOGLE_CREDS_JSON"])
 creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 client = gspread.authorize(creds)
@@ -25,8 +26,7 @@ client = gspread.authorize(creds)
 def is_bot(user_agent):
     KNOWN_BOTS = [
         "google", "proxy", "crawler", "scanner", "preview", "fetch", "urlcheck",
-        "defense", "proofpoint", "barracuda", "mimecast", "outlook", "microsoft",
-        "googleimageproxy"
+        "defense", "proofpoint", "barracuda", "mimecast", "outlook", "microsoft"
     ]
     return any(bot in user_agent.lower() for bot in KNOWN_BOTS)
 
@@ -40,7 +40,7 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
         headers = sheet.row_values(1)
         col_map = {key.strip(): idx for idx, key in enumerate(headers)}
 
-    data = sheet.get_all_values()[1:]
+    data = sheet.get_all_values()[1:]  # Skip header
     found = False
 
     for i, row in enumerate(data):
@@ -49,7 +49,7 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
             current_count = int(row[col_map["Open_count"]] or "0") + 1
             sheet.update_cell(row_num, col_map["Open_count"] + 1, current_count)
             sheet.update_cell(row_num, col_map["Last_Open"] + 1, timestamp)
-            sheet.update_cell(row_num, col_map["Status"] + 1, "VERIFIED HUMAN OPEN")
+            sheet.update_cell(row_num, col_map["Status"] + 1, "OPENED")
 
             if "From" in col_map:
                 sheet.update_cell(row_num, col_map["From"] + 1, sender)
@@ -71,7 +71,7 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
     if not found:
         new_row = ["" for _ in headers]
         new_row[col_map["Timestamp"]] = timestamp
-        new_row[col_map["Status"]] = "VERIFIED HUMAN OPEN"
+        new_row[col_map["Status"]] = "OPENED"
         new_row[col_map["Email"]] = email
         new_row[col_map["Open_count"]] = 1
         new_row[col_map["Last_Open"]] = timestamp
@@ -99,7 +99,6 @@ def track(path):
 
     user_agent = request.headers.get("User-Agent", "").lower()
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-
     confidence = "High"
     if is_bot(user_agent):
         confidence = "Low"
@@ -129,9 +128,9 @@ def track(path):
         try:
             if confidence == "High":
                 update_sheet(sheet, email, sender, timestamp, stage=stage, subject=subject)
-                print(f"✅ Tracked VERIFIED open: {email} from {sender}")
+                print(f"✅ Tracked: {email} from {sender} (stage: {stage}, subject: {subject})")
             else:
-                print(f"⚠ Bot-like open ignored: {email} — UA: {user_agent}")
+                print(f"⚠️ Ignored bot open for: {email} — UA: {user_agent}")
         except Exception as err:
             print(f"❌ Sheet update failed: {err}")
 
