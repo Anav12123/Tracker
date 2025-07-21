@@ -34,7 +34,6 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
 
     col_map = {h: i for i, h in enumerate(headers)}
 
-    # Ensure required columns exist
     for col in ["Status", "Open_count", "Last_Open", "From", "Subject"]:
         if col not in col_map:
             sheet.insert_cols([[col]], col=len(headers)+1)
@@ -56,7 +55,6 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
                     sheet.update_cell(r, col_map[sc] + 1, "YES")
             return
 
-    # Append new row
     new = [""] * len(headers)
     new[col_map["Timestamp"]] = timestamp
     new[col_map["Status"]] = "OPENED"
@@ -83,7 +81,8 @@ PIXEL_BYTES = (
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def track(path):
-    timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(IST)
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
     try:
         token = path.split('.')[0]
@@ -91,14 +90,31 @@ def track(path):
         payload = base64.urlsafe_b64decode(padded.encode())
         meta = json.loads(payload)
         info = meta.get("metadata", {})
+
         email = info.get("email")
         sender = info.get("sender")
         stage = info.get("stage")
         subject = info.get("subject")
         sheet_name = info.get("sheet", DEFAULT_SHEET_NAME)
+        sent_time_str = info.get("sent_time")  # New field
+
+        # Parse sent_time
+        sent_time = datetime.strptime(sent_time_str, "%Y-%m-%d %H:%M:%S%z") if sent_time_str else None
+
+        # Check for proxy opens
+        ip = request.remote_addr
+        user_agent = request.headers.get("User-Agent", "")
+
+        if sent_time and ("GoogleImageProxy" in user_agent or ip.startswith("66.249.")):
+            delta = (now - sent_time).total_seconds()
+            if delta < 5:
+                print(f"⚠️ Ignored early proxy open from {ip} (Δ = {delta:.2f}s)")
+                return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
+
         sheet = client.open(sheet_name).sheet1
+
     except Exception as e:
-        print("⚠ Invalid metadata:", e)
+        print("⚠ Invalid metadata or decoding error:", e)
         return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
 
     if email and sender:
