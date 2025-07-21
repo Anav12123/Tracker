@@ -1,5 +1,6 @@
 from flask import Flask, request, send_file
 from datetime import datetime
+from ipaddress import ip_address, ip_network
 import base64
 import json
 import os
@@ -10,17 +11,49 @@ from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
-# === Google Sheets Setup ===
+# === Config ===
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 DEFAULT_SHEET_NAME = "EmailTRACKV2"
+SUSPICIOUS_SHEET_NAME = "SuspiciousIPs"
 IST = pytz.timezone("Asia/Kolkata")
 
+GMAIL_CIDRS = [
+    "66.102.0.0/20",
+    "64.233.160.0/19",
+    "74.125.0.0/16",
+    "108.177.0.0/17",
+    "66.249.80.0/20"
+]
+
+# === Google Sheets Auth ===
 creds_info = json.loads(os.environ["GOOGLE_CREDS_JSON"])
 creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 client = gspread.authorize(creds)
+
+# === Utility: Check if IP is from Gmail proxy ===
+def is_proxy_ip(ip_str):
+    try:
+        ip_obj = ip_address(ip_str)
+        return any(ip_obj in ip_network(cidr) for cidr in GMAIL_CIDRS)
+    except:
+        return False
+
+# === Log suspicious IP ===
+def log_suspicious_open(ip, email, user_agent, delta, timestamp):
+    try:
+        sheet = client.open(DEFAULT_SHEET_NAME)
+        try:
+            ws = sheet.worksheet(SUSPICIOUS_SHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sheet.add_worksheet(title=SUSPICIOUS_SHEET_NAME, rows=1000, cols=10)
+            ws.append_row(["Timestamp", "IP", "Email", "UserAgent", "Delta"])
+
+        ws.append_row([timestamp, ip, email, user_agent, f"{delta:.2f}s"])
+    except Exception as e:
+        print("⚠ Failed to log suspicious open:", e)
 
 # === Sheet Updater ===
 def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
@@ -33,7 +66,6 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
         sheet.append_row(headers)
 
     col_map = {h: i for i, h in enumerate(headers)}
-
     for col in ["Status", "Open_count", "Last_Open", "From", "Subject"]:
         if col not in col_map:
             sheet.insert_cols([[col]], col=len(headers)+1)
@@ -69,7 +101,7 @@ def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
             new[col_map[sc]] = "YES"
     sheet.append_row(new)
 
-# === Transparent GIF Bytes ===
+# === Transparent Pixel ===
 PIXEL_BYTES = (
     b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00"
     b"\xFF\xFF\xFF!\xF9\x04\x01\x00\x00\x00\x00,"
@@ -77,7 +109,7 @@ PIXEL_BYTES = (
     b"L\x01\x00;"
 )
 
-# === Tracking Endpoint ===
+# === Track Endpoint ===
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def track(path):
@@ -96,20 +128,23 @@ def track(path):
         stage = info.get("stage")
         subject = info.get("subject")
         sheet_name = info.get("sheet", DEFAULT_SHEET_NAME)
-        sent_time_str = info.get("sent_time")  # New field
-
-        # Parse sent_time
+        sent_time_str = info.get("sent_time")
+        print(sent_time_str)
         sent_time = datetime.strptime(sent_time_str, "%Y-%m-%d %H:%M:%S%z") if sent_time_str else None
-
-        # Check for proxy opens
+        print(sent_time)
         ip = request.remote_addr
         user_agent = request.headers.get("User-Agent", "")
 
-        if sent_time and ("GoogleImageProxy" in user_agent or ip.startswith("66.249.")):
-            delta = (now - sent_time).total_seconds()
-            if delta < 10:
-                print(f"⚠️ Ignored early proxy open from {ip} (Δ = {delta:.2f}s)")
-                return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
+        suspicious = False
+        if sent_time:
+            delta = (now - sent_time.astimezone(IST)).total_seconds()
+            if delta < 10 and is_proxy_ip(ip):
+                suspicious = True
+                log_suspicious_open(ip, email, user_agent, delta, timestamp)
+
+        if suspicious:
+            print(f"⚠ Ignored early proxy open from {ip}")
+            return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
 
         sheet = client.open(sheet_name).sheet1
 
@@ -119,7 +154,7 @@ def track(path):
 
     if email and sender:
         update_sheet(sheet, email, sender, timestamp, stage, subject)
-        print(f"✅ Tracked open for {email} at {timestamp}")
+        print(f" Tracked open for {email} at {timestamp}")
 
     return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
 
