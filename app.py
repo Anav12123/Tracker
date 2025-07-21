@@ -7,6 +7,8 @@ import io
 import pytz
 import gspread
 from google.oauth2.service_account import Credentials
+from ipaddress import ip_address, ip_network
+import time
 
 app = Flask(__name__)
 
@@ -21,6 +23,54 @@ IST = pytz.timezone("Asia/Kolkata")
 creds_info = json.loads(os.environ["GOOGLE_CREDS_JSON"])
 creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 client = gspread.authorize(creds)
+
+# === Gmail CIDR List ===
+GMAIL_CIDRS = [
+    "66.102.0.0/20",
+    "64.233.160.0/19",
+    "74.125.0.0/16",
+    "108.177.0.0/17"
+]
+
+def is_proxy_ip(ip):
+    try:
+        ip_obj = ip_address(ip)
+        return any(ip_obj in ip_network(cidr) for cidr in GMAIL_CIDRS)
+    except:
+        return False
+
+# === Suspicious IP Tracking ===
+SUSPICIOUS_IP_CACHE = {
+    "ips": set(),
+    "last_fetched": 0
+}
+
+def get_suspicious_ips():
+    now = time.time()
+    if now - SUSPICIOUS_IP_CACHE["last_fetched"] > 300:
+        try:
+            sheet = client.open(DEFAULT_SHEET_NAME).worksheet("SuspiciousIPs")
+            values = sheet.col_values(1)[1:]
+            SUSPICIOUS_IP_CACHE["ips"] = set(values)
+            SUSPICIOUS_IP_CACHE["last_fetched"] = now
+        except Exception as e:
+            print("⚠️ Error fetching Suspicious IPs:", e)
+    return SUSPICIOUS_IP_CACHE["ips"]
+
+def log_suspicious_ip(ip, delta, email="", sender=""):
+    try:
+        sheet = client.open(DEFAULT_SHEET_NAME)
+        try:
+            ws = sheet.worksheet("SuspiciousIPs")
+        except:
+            ws = sheet.add_worksheet(title="SuspiciousIPs", rows="1000", cols="4")
+            ws.append_row(["IP", "Detected_At", "Delta_sec", "Sample_Email"])
+
+        now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row([ip, now, f"{delta:.2f}", email])
+        print(f"🚨 Logged suspicious IP: {ip}")
+    except Exception as e:
+        print("⚠️ Failed to log suspicious IP:", e)
 
 # === Sheet Updater ===
 def update_sheet(sheet, email, sender, timestamp, stage=None, subject=None):
@@ -96,19 +146,23 @@ def track(path):
         stage = info.get("stage")
         subject = info.get("subject")
         sheet_name = info.get("sheet", DEFAULT_SHEET_NAME)
-        sent_time_str = info.get("sent_time")  # New field
+        sent_time_str = info.get("sent_time")
 
-        # Parse sent_time
-        sent_time = datetime.strptime(sent_time_str, "%Y-%m-%d %H:%M:%S%z") if sent_time_str else None
-
-        # Check for proxy opens
         ip = request.remote_addr
         user_agent = request.headers.get("User-Agent", "")
 
-        if sent_time and ("GoogleImageProxy" in user_agent or ip.startswith("66.249.")):
-            delta = (now - sent_time).total_seconds()
+        sent_time = datetime.strptime(sent_time_str, "%Y-%m-%d %H:%M:%S%z") if sent_time_str else None
+
+        suspicious_ips = get_suspicious_ips()
+        if ip in suspicious_ips:
+            print(f"🚫 Skipping known suspicious IP: {ip}")
+            return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
+
+        if sent_time and (is_proxy_ip(ip) or "GoogleImageProxy" in user_agent or ip.startswith("66.249.")):
+            delta = (datetime.now(pytz.utc) - sent_time).total_seconds()
             if delta < 5:
-                print(f"⚠️ Ignored early proxy open from {ip} (Δ = {delta:.2f}s)")
+                log_suspicious_ip(ip, delta, email=email, sender=sender)
+                print(f"⚠️ Early proxy open from {ip} — ignored (Δ = {delta:.2f}s)")
                 return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
 
         sheet = client.open(sheet_name).sheet1
