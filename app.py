@@ -125,14 +125,7 @@ def track(path):
     Tracking pixel endpoint.
     Expects base64-encoded JSON metadata in the URL path.
     """
-    try:
-        user_tz = pytz.timezone(info.get("timezone", "Asia/Kolkata"))
-    except Exception as e:
-        app.logger.warning("Invalid timezone '%s'. Using default IST. Error: %s", info.get("timezone"), e)
-        user_tz = IST
-
-    now = datetime.now(user_tz)
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    
 
 
     # Decode metadata token
@@ -144,6 +137,15 @@ def track(path):
     except Exception as e:
         app.logger.error("Invalid metadata: %s", e)
         return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
+
+    try:
+        user_tz = pytz.timezone(info.get("timezone", "Asia/Kolkata"))
+    except Exception as e:
+        app.logger.warning("Invalid timezone '%s'. Using default IST. Error: %s", info.get("timezone"), e)
+        user_tz = IST
+
+    now = datetime.now(user_tz)
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
     # Extract fields
     email       = info.get("email")
