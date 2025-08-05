@@ -83,7 +83,7 @@ def update_sheet(
             lead_email = row[col_map.get("Leads_email", -1)].strip().lower() if len(row) > col_map.get("Leads_email", -1) else ""
             email_id   = row[col_map.get("Email_ID", -1)].strip().lower() if len(row) > col_map.get("Email_ID", -1) else ""
 
-            if email.lower() == lead_email and email.lower() == email_id:
+            if email.lower() == email_id:
                 # Increment open count
                 try:
                     count = int(row[col_map.get("Open_count", 0)] or "0") + 1
