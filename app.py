@@ -134,20 +134,7 @@ def update_sheet(
 
 
     # 6) Append new row
-    new_row = [""] * len(headers)
-    new_row[col_map["Open_timestamp"]]        = timestamp
-    new_row[col_map["Open_status"]]           = "OPENED"
-    new_row[col_map["Leads_email"]]           = email
-    new_row[col_map["Open_count"]]            = "1"
-    new_row[col_map["Last_open_timestamp"]]   = timestamp
-    new_row[col_map["From"]]                  = sender
-    new_row[col_map["Subject"]]               = subject or ""
-    new_row[col_map["Campaign_name"]]         = sheet_name or ""
-    new_row[col_map["Timezone"]]              = timezone or ""
-    new_row[col_map["Start_Date"]]            = start_date or ""
-    new_row[col_map["Template"]]              = template or ""
-
-    sheet.append_row(new_row)
+   
 
 
 @app.route('/', defaults={'path': ''})
