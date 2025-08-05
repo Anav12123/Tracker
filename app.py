@@ -44,48 +44,58 @@ def update_sheet(
     template: str = None
 ):
     """
-    Update existing row for `email` or append new.
-    Ensures header row includes all columns, then updates/appends.
+    Update existing row for email match or append new.
+    Only updates rows where Leads_email and Email_ID both match.
     """
-    # 1) Ensure header row exists
+    # 1. Ensure header
     headers = sheet.row_values(1)
     if not headers:
         headers = [
+            "NAME", "Email_ID", "STATUS", "SENDER", "TIMESTAMP",
             "Open_timestamp", "Open_status", "Leads_email", "Open_count",
             "Last_open_timestamp", "From", "Subject", "Campaign_name",
             "Timezone", "Start_Date", "Template"
         ]
         sheet.append_row(headers)
 
-    # 2) Build header→index map
+    # 2. Header index map
     col_map = {h: i for i, h in enumerate(headers)}
 
-    # 3) Ensure all needed columns present
-    required = [
-        "Open_status", "Open_count", "Last_open_timestamp", "From", "Subject",
-        "Campaign_name", "Timezone", "Start_Date", "Template"
+    # 3. Ensure needed columns exist
+    required_cols = [
+        "Open_timestamp", "Open_status", "Leads_email", "Open_count",
+        "Last_open_timestamp", "From", "Subject", "Campaign_name",
+        "Timezone", "Start_Date", "Template", "Email_ID"
     ]
-    for col in required:
+    for col in required_cols:
         if col not in col_map:
             headers.append(col)
             col_map[col] = len(headers) - 1
             sheet.update_cell(1, len(headers), col)
 
-    # 4) Read existing rows
-    body = sheet.get_all_values()[1:]  # skip header
+    # 4. Get sheet data (skip headers)
+    body = sheet.get_all_values()[1:]
 
-    # 5) Try update existing email row
+    # 5. Try to find matching row
     matched = False
-    for ridx, row in enumerate(body, start=2):
+    for ridx, row in enumerate(body, start=2):  # 1-based + header
         try:
-            if len(row) > col_map["Leads_email"] and row[col_map["Leads_email"]].strip().lower() == email.lower():
-                # increment open count
-                count = int(row[col_map.get("Open_count", 0)] or "0") + 1
-                sheet.update_cell(ridx, col_map["Open_count"] + 1, str(count))
+            lead_email = row[col_map.get("Leads_email", -1)].strip().lower() if len(row) > col_map.get("Leads_email", -1) else ""
+            email_id   = row[col_map.get("Email_ID", -1)].strip().lower() if len(row) > col_map.get("Email_ID", -1) else ""
 
+            if email.lower() == lead_email and email.lower() == email_id:
+                # Increment open count
+                try:
+                    count = int(row[col_map.get("Open_count", 0)] or "0") + 1
+                except:
+                    count = 1
+
+                sheet.update_cell(ridx, col_map["Open_count"] + 1, str(count))
                 sheet.update_cell(ridx, col_map["Open_timestamp"] + 1, timestamp)
-                sheet.update_cell(ridx, col_map["Open_status"]    + 1, "OPENED")
-                sheet.update_cell(ridx, col_map["From"]           + 1, sender)
+                sheet.update_cell(ridx, col_map["Last_open_timestamp"] + 1, timestamp)
+                sheet.update_cell(ridx, col_map["Open_status"] + 1, "OPENED")
+                sheet.update_cell(ridx, col_map["From"] + 1, sender)
+
                 if subject:
                     sheet.update_cell(ridx, col_map["Subject"] + 1, subject)
                 if sheet_name:
@@ -100,25 +110,27 @@ def update_sheet(
                 matched = True
                 break
         except Exception as e:
-            app.logger.warning(f"Skipping row {ridx} due to error: {e}")
+            app.logger.warning(f"Error matching row {ridx}: {e}")
 
+    # 6. Append if no match
     if not matched:
-        # Append new row
         new_row = [""] * len(headers)
-        new_row[col_map["Open_timestamp"]]        = timestamp
-        new_row[col_map["Open_status"]]           = "OPENED"
-        new_row[col_map["Leads_email"]]           = email
-        new_row[col_map["Open_count"]]            = "1"
-        new_row[col_map["Last_open_timestamp"]]   = timestamp
-        new_row[col_map["From"]]                  = sender
-        new_row[col_map["Subject"]]               = subject or ""
-        new_row[col_map["Campaign_name"]]         = sheet_name or ""
-        new_row[col_map["Timezone"]]              = timezone or ""
-        new_row[col_map["Start_Date"]]            = start_date or ""
-        new_row[col_map["Template"]]              = template or ""
+        new_row[col_map["Leads_email"]]         = email
+        new_row[col_map["Email_ID"]]            = email
+        new_row[col_map["Open_timestamp"]]      = timestamp
+        new_row[col_map["Last_open_timestamp"]] = timestamp
+        new_row[col_map["Open_status"]]         = "OPENED"
+        new_row[col_map["Open_count"]]          = "1"
+        new_row[col_map["From"]]                = sender
+        new_row[col_map["Subject"]]             = subject or ""
+        new_row[col_map["Campaign_name"]]       = sheet_name or ""
+        new_row[col_map["Timezone"]]            = timezone or ""
+        new_row[col_map["Start_Date"]]          = start_date or ""
+        new_row[col_map["Template"]]            = template or ""
 
         sheet.append_row(new_row)
-        app.logger.info("🔄 Appended new row for email: %s", email)
+        app.logger.info("🔄 Appended new open row for email: %s", email)
+
 
 
     # 6) Append new row
