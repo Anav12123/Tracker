@@ -75,31 +75,51 @@ def update_sheet(
     body = sheet.get_all_values()[1:]  # skip header
 
     # 5) Try update existing email row
+    matched = False
     for ridx, row in enumerate(body, start=2):
-        if row[col_map["Leads_email"]].strip().lower() == email.lower():
-            # increment open count
-            count = int(row[col_map["Open_count"]] or "0") + 1
-            sheet.update_cell(ridx, col_map["Open_count"] + 1, str(count))
+        try:
+            if len(row) > col_map["Leads_email"] and row[col_map["Leads_email"]].strip().lower() == email.lower():
+                # increment open count
+                count = int(row[col_map.get("Open_count", 0)] or "0") + 1
+                sheet.update_cell(ridx, col_map["Open_count"] + 1, str(count))
 
-            # update renamed fields
-            sheet.update_cell(ridx, col_map["Open_timestamp"] + 1, timestamp)
-            sheet.update_cell(ridx, col_map["Open_status"]    + 1, "OPENED")
-            sheet.update_cell(ridx, col_map["From"]           + 1, sender)
+                sheet.update_cell(ridx, col_map["Open_timestamp"] + 1, timestamp)
+                sheet.update_cell(ridx, col_map["Open_status"]    + 1, "OPENED")
+                sheet.update_cell(ridx, col_map["From"]           + 1, sender)
+                if subject:
+                    sheet.update_cell(ridx, col_map["Subject"] + 1, subject)
+                if sheet_name:
+                    sheet.update_cell(ridx, col_map["Campaign_name"] + 1, sheet_name)
+                if timezone:
+                    sheet.update_cell(ridx, col_map["Timezone"] + 1, timezone)
+                if start_date:
+                    sheet.update_cell(ridx, col_map["Start_Date"] + 1, start_date)
+                if template:
+                    sheet.update_cell(ridx, col_map["Template"] + 1, template)
 
-            # update subject
-            if subject:
-                sheet.update_cell(ridx, col_map["Subject"] + 1, subject)
+                matched = True
+                break
+        except Exception as e:
+            app.logger.warning(f"Skipping row {ridx} due to error: {e}")
 
-            # update renamed metadata
-            if sheet_name:
-                sheet.update_cell(ridx, col_map["Campaign_name"] + 1, sheet_name)
-            if timezone:
-                sheet.update_cell(ridx, col_map["Timezone"]      + 1, timezone)
-            if start_date:
-                sheet.update_cell(ridx, col_map["Start_Date"]     + 1, start_date)
-            if template:
-                sheet.update_cell(ridx, col_map["Template"]       + 1, template)
-            return
+    if not matched:
+        # Append new row
+        new_row = [""] * len(headers)
+        new_row[col_map["Open_timestamp"]]        = timestamp
+        new_row[col_map["Open_status"]]           = "OPENED"
+        new_row[col_map["Leads_email"]]           = email
+        new_row[col_map["Open_count"]]            = "1"
+        new_row[col_map["Last_open_timestamp"]]   = timestamp
+        new_row[col_map["From"]]                  = sender
+        new_row[col_map["Subject"]]               = subject or ""
+        new_row[col_map["Campaign_name"]]         = sheet_name or ""
+        new_row[col_map["Timezone"]]              = timezone or ""
+        new_row[col_map["Start_Date"]]            = start_date or ""
+        new_row[col_map["Template"]]              = template or ""
+
+        sheet.append_row(new_row)
+        app.logger.info("🔄 Appended new row for email: %s", email)
+
 
     # 6) Append new row
     new_row = [""] * len(headers)
