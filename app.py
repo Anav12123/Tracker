@@ -83,7 +83,15 @@ def update_sheet(
             lead_email = row[col_map.get("Leads_email", -1)].strip().lower() if len(row) > col_map.get("Leads_email", -1) else ""
             email_id   = row[col_map.get("Email_ID", -1)].strip().lower() if len(row) > col_map.get("Email_ID", -1) else ""
 
-            if email.lower() == email_id:
+            sender_cell = row[col_map.get("SENDER", -1)].strip().lower() if len(row) > col_map.get("SENDER", -1) else ""
+
+            if email.lower() == email_id and sender.lower() == sender_cell:
+                if "Leads_email" in col_map:
+                    leads_email_cell = row[col_map["Leads_email"]] if col_map["Leads_email"] < len(row) else ""
+                    if not leads_email_cell.strip():
+                        sheet.update_cell(ridx, col_map["Leads_email"] + 1, email)
+
+
                 # Increment open count
                 try:
                     count = int(row[col_map.get("Open_count", 0)] or "0") + 1
