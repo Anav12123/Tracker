@@ -1,11 +1,12 @@
-from flask import Flask, send_file
-from datetime import datetime, timezone
+from flask import Flask, send_file, request
+from datetime import datetime, timezone as dt_timezone
 import base64
 import json
 import os
 import io
 import pytz
 import gspread
+from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
@@ -34,34 +35,36 @@ creds      = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 gc         = gspread.authorize(creds)
 
 
-def ensure_columns(headers, sheet):
+def ensure_columns(sheet, required):
     """
-    Ensures that all required columns (standard + legacy) exist.
-    Returns updated headers list, a map of header->index, and a bool whether we added any.
+    Guarantees all required columns exist in row 1.
+    Expands sheet width if needed and writes headers in one batch.
+    Returns final_headers and a header->index map.
     """
-    col_map = {h: i for i, h in enumerate(headers)}
+    current = sheet.row_values(1) or []
+    header_set = set(current)
+    final_headers = list(current)
 
-    required = [
-        "NAME", "Email_ID", "STATUS", "SENDER", "TIMESTAMP",
-        "Open_timestamp", "Open_status", "Leads_email", "Open_count",
-        "Last_open_timestamp", "From", "Subject", "Campaign_name",
-        "Timezone", "Start_Date", "Template",
-        # standardized open flags
-        "Followup1_Open", "Followup2_Open", "Followup3_Open",
-        # legacy open flags
-        "Opened_FW1", "Opened_FW2", "Opened_FW3"
-    ]
-
-    updated = False
     for col in required:
-        if col not in col_map:
-            headers.append(col)
-            col_map[col] = len(headers) - 1
-            sheet.update_cell(1, len(headers), col)
-            updated = True
+        if col not in header_set:
+            final_headers.append(col)
+            header_set.add(col)
 
-    # Return new headers list, map, and flag
-    return headers, {h: i for i, h in enumerate(headers)}, updated
+    # Expand columns if needed
+    needed_cols = len(final_headers)
+    if sheet.col_count < needed_cols:
+        # Prefer add_cols, fallback to resize
+        try:
+            sheet.add_cols(needed_cols - sheet.col_count)
+        except Exception:
+            sheet.resize(rows=sheet.row_count, cols=needed_cols)
+
+    # Batch update the header row
+    end_a1 = rowcol_to_a1(1, needed_cols)
+    sheet.update(f"A1:{end_a1}", [final_headers])
+
+    col_map = {h: i for i, h in enumerate(final_headers)}
+    return final_headers, col_map
 
 
 def update_sheet(
@@ -71,7 +74,7 @@ def update_sheet(
     timestamp: str,
     sheet_name: str = None,
     subject: str = None,
-    timezone: str = None,
+    timezone_str: str = None,
     start_date: str = None,
     template: str = None,
     stage: str = None
@@ -83,74 +86,77 @@ def update_sheet(
       - legacy Opened_FWN = "YES"
     """
 
-    # 1. Read or initialize headers
-    headers = sheet.row_values(1)
-    if not headers:
-        headers = [
-            "NAME", "Email_ID", "STATUS", "SENDER", "TIMESTAMP",
-            "Open_timestamp", "Open_status", "Leads_email", "Open_count",
-            "Last_open_timestamp", "From", "Subject", "Campaign_name",
-            "Timezone", "Start_Date", "Template"
-        ]
-        sheet.append_row(headers)
-
-    headers, col_map, _ = ensure_columns(headers, sheet)
-
-    # 2. Derive open column name from stage
+    # Determine open flag names up front
     open_col = stage.replace("_Sent", "_Open") if stage else None
-    if open_col and open_col not in col_map:
-        headers.append(open_col)
-        col_map[open_col] = len(headers) - 1
-        sheet.update_cell(1, len(headers), open_col)
 
-    # 3. Fetch body rows (skip header)
+    required = [
+        "NAME", "Email_ID", "STATUS", "SENDER", "TIMESTAMP",
+        "Open_timestamp", "Open_status", "Leads_email", "Open_count",
+        "Last_open_timestamp", "From", "Subject", "Campaign_name",
+        "Timezone", "Start_Date", "Template",
+        # standardized open flags
+        "Followup1_Open", "Followup2_Open", "Followup3_Open",
+        # legacy open flags
+        "Opened_FW1", "Opened_FW2", "Opened_FW3",
+    ]
+
+    # Ensure the dynamic open column is present if stage provided
+    if open_col and open_col not in required:
+        required.append(open_col)
+
+    headers, col_map = ensure_columns(sheet, required)
+
+    # Helper to safely read a cell from a row by header name
+    def cell_value(row, header_name):
+        idx = col_map.get(header_name, -1)
+        return row[idx] if 0 <= idx < len(row) else ""
+
+    # Fetch body rows
     body = sheet.get_all_values()[1:]
 
-    # 4. Find and update matching row
+    # Flexible match on email and sender fields
+    email_l = (email or "").strip().lower()
+    sender_l = (sender or "").strip().lower()
+
     matched = False
     for ridx, row in enumerate(body, start=2):
         try:
-            email_id_cell = row[col_map.get("Email_ID", -1)].strip().lower() \
-                            if col_map.get("Email_ID", -1) < len(row) else ""
-            sender_cell   = row[col_map.get("SENDER", -1)].strip().lower() \
-                            if col_map.get("SENDER", -1) < len(row) else ""
+            email_cell = (cell_value(row, "Email_ID") or cell_value(row, "Leads_email")).strip().lower()
+            sender_cell = (cell_value(row, "SENDER") or cell_value(row, "From")).strip().lower()
 
-            if email.lower() == email_id_cell and sender.lower() == sender_cell:
-                # Fill missing Leads_email
-                leads_idx = col_map.get("Leads_email")
-                if leads_idx is not None:
-                    existing = row[leads_idx] if leads_idx < len(row) else ""
-                    if not existing.strip():
-                        sheet.update_cell(ridx, leads_idx + 1, email)
-
-                # Increment counts & timestamps
+            if email_l == email_cell and sender_l == sender_cell:
+                # Increment open count
                 try:
-                    count = int(row[col_map.get("Open_count", 0)] or "0") + 1
+                    count = int(cell_value(row, "Open_count") or "0") + 1
                 except ValueError:
                     count = 1
 
-                sheet.update_cell(ridx, col_map["Open_count"] + 1, str(count))
-                sheet.update_cell(ridx, col_map["Open_timestamp"] + 1, timestamp)
-                sheet.update_cell(ridx, col_map["Last_open_timestamp"] + 1, timestamp)
-                sheet.update_cell(ridx, col_map["Open_status"] + 1,       "OPENED")
-                sheet.update_cell(ridx, col_map["From"] + 1,              sender)
-
+                # Collect updates to minimize repeated lookups
+                updates = [
+                    ("Open_count", str(count)),
+                    ("Open_timestamp",      timestamp),
+                    ("Last_open_timestamp", timestamp),
+                    ("Open_status", "OPENED"),
+                    ("From", sender),
+                ]
                 if subject:
-                    sheet.update_cell(ridx, col_map["Subject"] + 1, subject)
+                    updates.append(("Subject", subject))
                 if sheet_name:
-                    sheet.update_cell(ridx, col_map["Campaign_name"] + 1, sheet_name)
-                if timezone:
-                    sheet.update_cell(ridx, col_map["Timezone"] + 1, timezone)
+                    updates.append(("Campaign_name", sheet_name))
+                if timezone_str:
+                    updates.append(("Timezone", timezone_str))
                 if start_date:
-                    sheet.update_cell(ridx, col_map["Start_Date"] + 1, start_date)
+                    updates.append(("Start_Date", start_date))
                 if template:
-                    sheet.update_cell(ridx, col_map["Template"] + 1, template)
+                    updates.append(("Template", template))
+                # Fill missing Leads_email if empty
+                if not cell_value(row, "Leads_email").strip():
+                    updates.append(("Leads_email", email))
 
-                # mark standardized flag
+                # Open flags
                 if open_col and open_col in col_map:
-                    sheet.update_cell(ridx, col_map[open_col] + 1, "OPENED")
+                    updates.append((open_col, "OPENED"))
 
-                # mark legacy flag
                 legacy_flag = None
                 if open_col == "Followup1_Open":
                     legacy_flag = "Opened_FW1"
@@ -158,9 +164,16 @@ def update_sheet(
                     legacy_flag = "Opened_FW2"
                 elif open_col == "Followup3_Open":
                     legacy_flag = "Opened_FW3"
-
                 if legacy_flag and legacy_flag in col_map:
-                    sheet.update_cell(ridx, col_map[legacy_flag] + 1, "YES")
+                    updates.append((legacy_flag, "YES"))
+
+                # Also keep SENDER in sync with From
+                if "SENDER" in col_map:
+                    updates.append(("SENDER", sender))
+
+                # Apply updates
+                for key, val in updates:
+                    sheet.update_cell(ridx, col_map[key] + 1, val)
 
                 matched = True
                 break
@@ -168,35 +181,42 @@ def update_sheet(
         except Exception as e:
             app.logger.warning(f"Error updating row {ridx}: {e}")
 
-    # 5. Append a new row if no existing match
-    if not matched:
-        new_row = [""] * len(headers)
-        new_row[col_map["Leads_email"]]         = email
-        new_row[col_map["Email_ID"]]            = email
-        new_row[col_map["Open_timestamp"]]      = timestamp
-        new_row[col_map["Last_open_timestamp"]] = timestamp
-        new_row[col_map["Open_status"]]         = "OPENED"
-        new_row[col_map["Open_count"]]          = "1"
-        new_row[col_map["From"]]                = sender
-        new_row[col_map["Subject"]]             = subject or ""
-        new_row[col_map["Campaign_name"]]       = sheet_name or ""
-        new_row[col_map["Timezone"]]            = timezone or ""
-        new_row[col_map["Start_Date"]]          = start_date or ""
-        new_row[col_map["Template"]]            = template or ""
+    if matched:
+        return
 
-        if open_col and open_col in col_map:
-            new_row[col_map[open_col]] = "OPENED"
+    # Append new row
+    new_row = [""] * len(headers)
+    # Core fields
+    for k, v in [
+        ("Leads_email", email),
+        ("Email_ID", email),
+        ("Open_timestamp", timestamp),
+        ("Last_open_timestamp", timestamp),
+        ("Open_status", "OPENED"),
+        ("Open_count", "1"),
+        ("From", sender),
+        ("SENDER", sender),
+        ("Subject", subject or ""),
+        ("Campaign_name", sheet_name or ""),
+        ("Timezone", timezone_str or ""),
+        ("Start_Date", start_date or ""),
+        ("Template", template or ""),
+    ]:
+        if k in col_map:
+            new_row[col_map[k]] = v
 
-        # Also set legacy if applicable
-        if open_col == "Followup1_Open":
-            new_row[col_map["Opened_FW1"]] = "YES"
-        elif open_col == "Followup2_Open":
-            new_row[col_map["Opened_FW2"]] = "YES"
-        elif open_col == "Followup3_Open":
-            new_row[col_map["Opened_FW3"]] = "YES"
+    if open_col and open_col in col_map:
+        new_row[col_map[open_col]] = "OPENED"
 
-        sheet.append_row(new_row)
-        app.logger.info("🔄 Appended new open row for email: %s", email)
+    if open_col == "Followup1_Open" and "Opened_FW1" in col_map:
+        new_row[col_map["Opened_FW1"]] = "YES"
+    elif open_col == "Followup2_Open" and "Opened_FW2" in col_map:
+        new_row[col_map["Opened_FW2"]] = "YES"
+    elif open_col == "Followup3_Open" and "Opened_FW3" in col_map:
+        new_row[col_map["Opened_FW3"]] = "YES"
+
+    sheet.append_row(new_row)
+    app.logger.info("Appended new open row for email: %s", email)
 
 
 @app.route('/', defaults={'path': ''})
@@ -204,66 +224,73 @@ def update_sheet(
 def track(path):
     """
     Tracking pixel endpoint.
-    Expects base64-encoded JSON metadata in the URL path.
+    Expects base64 urlsafe encoded JSON in the URL path.
+    Accepts either {"metadata": {...}} or a flat dict as the payload.
     """
-    # Decode metadata token
+    # Decode metadata token from path or fallback to query param m
+    info = {}
     try:
-        token   = path.split('.')[0]
-        padded  = token + "=" * (-len(token) % 4)
-        payload = base64.urlsafe_b64decode(padded.encode())
-        info    = json.loads(payload).get("metadata", {})
+        token = request.args.get("m") or (path or "").split('.')[0]
+        padded = token + "=" * (-len(token) % 4)
+        payload = base64.urlsafe_b64decode(padded.encode()).decode("utf-8", errors="ignore")
+        raw = json.loads(payload)
+        info = raw.get("metadata", raw) or {}
         app.logger.info(f"Decoded metadata: {info}")
     except Exception as e:
-        app.logger.error("Invalid metadata: %s", e)
+        app.logger.error(f"Invalid metadata: {e}")
         return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
 
-    # Determine user timezone
+    # Determine user timezone safely
+    tz_str = info.get("timezone", "Asia/Kolkata")
     try:
-        user_tz = pytz.timezone(info.get("timezone", "Asia/Kolkata"))
+        user_tz = pytz.timezone(tz_str)
     except Exception:
         user_tz = IST
 
-    now       = datetime.now(user_tz)
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    now_local = datetime.now(user_tz)
+    timestamp = now_local.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Extract metadata fields
+    # Extract metadata fields with safe names
     email       = info.get("email")
     sender      = info.get("sender")
     sheet_tab   = info.get("sheet")
     subject     = info.get("subject")
-    timezone    = info.get("timezone")
-    start_date  = info.get("date")
+    timezone_str = info.get("timezone")
+    # Accept both keys for start date
+    start_date  = info.get("start_date") or info.get("date")
     template    = info.get("template")
     sent_time_s = info.get("sent_time")
     stage       = info.get("stage")
 
-    # Skip tracking if the open occurs too soon (<7s)
+    # Early hit guard less than seven seconds after sent time
     if sent_time_s:
         try:
-            sent_dt = datetime.fromisoformat(sent_time_s)
+            # Support trailing Z by normalizing to offset form
+            s = sent_time_s.replace("Z", "+00:00")
+            sent_dt = datetime.fromisoformat(s)
             if sent_dt.tzinfo is None:
-                sent_dt = sent_dt.replace(tzinfo=timezone.utc)  # assume UTC for naive
-            now_utc = datetime.now(timezone.utc)
+                sent_dt = sent_dt.replace(tzinfo=dt_timezone.utc)
+            now_utc = datetime.now(dt_timezone.utc)
             if (now_utc - sent_dt).total_seconds() < 7:
                 app.logger.info("Skipping early hit for %s", email)
                 return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
         except Exception as e:
             app.logger.warning(f"Early-hit check failed: {e}")
 
-    # Open (or create) the target sheet/tab
+    # Open or create the workbook and target tab
     try:
-        wb   = gc.open(MAILTRACKING_WORKBOOK)
+        wb = gc.open(MAILTRACKING_WORKBOOK)
         tabs = [ws.title for ws in wb.worksheets()]
         if not sheet_tab:
             sheet_tab = tabs[0] if tabs else "Sheet1"
         if sheet_tab not in tabs:
-            wb.add_worksheet(title=sheet_tab, rows="1000", cols="20")
+            wb.add_worksheet(title=sheet_tab, rows="1000", cols="50")
         sheet = wb.worksheet(sheet_tab)
     except Exception as e:
-        app.logger.error("Cannot open workbook/tab: %s", e)
+        app.logger.error(f"Cannot open workbook or tab: {e}")
         return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
 
-    # Record the open event
+    # Record the open event if we have essentials
     if email and sender:
         update_sheet(
             sheet,
@@ -272,16 +299,15 @@ def track(path):
             timestamp=timestamp,
             sheet_name=sheet_tab,
             subject=subject,
-            timezone=timezone,
+            timezone_str=timezone_str,
             start_date=start_date,
             template=template,
             stage=stage
         )
-        app.logger.info(
-            "Tracked open: %s → %s at %s (stage=%s)",
-            email, sheet_tab, timestamp, stage
-        )
+    else:
+        app.logger.warning("Missing essentials email or sender")
 
+    # Always return the pixel
     return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
 
 
