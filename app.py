@@ -1,5 +1,5 @@
 from flask import Flask, send_file
-from datetime import datetime
+from datetime import datetime, timezone
 import base64
 import json
 import os
@@ -241,11 +241,14 @@ def track(path):
     if sent_time_s:
         try:
             sent_dt = datetime.fromisoformat(sent_time_s)
-            if (now - sent_dt).total_seconds() < 7:
+            if sent_dt.tzinfo is None:
+                sent_dt = sent_dt.replace(tzinfo=timezone.utc)  # assume UTC for naive
+            now_utc = datetime.now(timezone.utc)
+            if (now_utc - sent_dt).total_seconds() < 7:
                 app.logger.info("Skipping early hit for %s", email)
                 return send_file(io.BytesIO(PIXEL_BYTES), mimetype="image/gif")
-        except ValueError:
-            pass
+        except Exception as e:
+            app.logger.warning(f"Early-hit check failed: {e}")
 
     # Open (or create) the target sheet/tab
     try:
