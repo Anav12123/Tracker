@@ -1,3 +1,4 @@
+
 from flask import Flask, send_file, request
 from datetime import datetime, timezone as dt_timezone
 import base64
@@ -79,14 +80,6 @@ def update_sheet(
     template: str = None,
     stage: str = None
 ):
-    """
-    Update existing row for email+sender match or append new.
-    Marks:
-      - standardized FollowupN_Open = "OPENED"
-      - legacy Opened_FWN = "YES"
-    """
-
-    # Determine open flag names up front
     open_col = stage.replace("_Sent", "_Open") if stage else None
 
     required = [
@@ -94,27 +87,18 @@ def update_sheet(
         "Open_timestamp", "Open_status", "Leads_email", "Open_count",
         "Last_open_timestamp", "From", "Subject", "Campaign_name",
         "Timezone", "Start_Date", "Template",
-        # standardized open flags
-        "Followup1_Open", "Followup2_Open", "Followup3_Open",
-        # legacy open flags
-        "Opened_FW1", "Opened_FW2", "Opened_FW3",
+        "Followup1_Open", "Followup2_Open", "Followup3_Open"
     ]
-
-    # Ensure the dynamic open column is present if stage provided
     if open_col and open_col not in required:
         required.append(open_col)
 
     headers, col_map = ensure_columns(sheet, required)
 
-    # Helper to safely read a cell from a row by header name
     def cell_value(row, header_name):
         idx = col_map.get(header_name, -1)
         return row[idx] if 0 <= idx < len(row) else ""
 
-    # Fetch body rows
     body = sheet.get_all_values()[1:]
-
-    # Flexible match on email and sender fields
     email_l = (email or "").strip().lower()
     sender_l = (sender or "").strip().lower()
 
@@ -125,98 +109,60 @@ def update_sheet(
             sender_cell = (cell_value(row, "SENDER") or cell_value(row, "From")).strip().lower()
 
             if email_l == email_cell and sender_l == sender_cell:
-                # Increment open count
-                try:
-                    count = int(cell_value(row, "Open_count") or "0") + 1
-                except ValueError:
-                    count = 1
+                count = int(cell_value(row, "Open_count") or "0") + 1 if cell_value(row, "Open_count") else 1
 
-                # Collect updates to minimize repeated lookups
                 updates = [
                     ("Open_count", str(count)),
-                    ("Open_timestamp",      timestamp),
+                    ("Open_timestamp", timestamp),
                     ("Last_open_timestamp", timestamp),
                     ("Open_status", "OPENED"),
                     ("From", sender),
+                    ("SENDER", sender),
+                    ("Leads_email", email),
+                    ("Subject", subject or ""),
+                    ("Campaign_name", sheet_name or ""),
+                    ("Timezone", timezone_str or ""),
+                    ("Start_Date", start_date or ""),
+                    ("Template", template or "")
                 ]
-                if subject:
-                    updates.append(("Subject", subject))
-                if sheet_name:
-                    updates.append(("Campaign_name", sheet_name))
-                if timezone_str:
-                    updates.append(("Timezone", timezone_str))
-                if start_date:
-                    updates.append(("Start_Date", start_date))
-                if template:
-                    updates.append(("Template", template))
-                # Fill missing Leads_email if empty
-                if not cell_value(row, "Leads_email").strip():
-                    updates.append(("Leads_email", email))
 
-                # Open flags
                 if open_col and open_col in col_map:
                     updates.append((open_col, "OPENED"))
 
-                legacy_flag = None
-                if open_col == "Followup1_Open":
-                    legacy_flag = "Opened_FW1"
-                elif open_col == "Followup2_Open":
-                    legacy_flag = "Opened_FW2"
-                elif open_col == "Followup3_Open":
-                    legacy_flag = "Opened_FW3"
-                if legacy_flag and legacy_flag in col_map:
-                    updates.append((legacy_flag, "YES"))
-
-                # Also keep SENDER in sync with From
-                if "SENDER" in col_map:
-                    updates.append(("SENDER", sender))
-
-                # Apply updates
                 for key, val in updates:
                     sheet.update_cell(ridx, col_map[key] + 1, val)
 
                 matched = True
                 break
-
         except Exception as e:
             app.logger.warning(f"Error updating row {ridx}: {e}")
 
     if matched:
         return
 
-    # Append new row
     new_row = [""] * len(headers)
-    # Core fields
-    for k, v in [
-        ("Leads_email", email),
-        ("Email_ID", email),
-        ("Open_timestamp", timestamp),
-        ("Last_open_timestamp", timestamp),
-        ("Open_status", "OPENED"),
-        ("Open_count", "1"),
-        ("From", sender),
-        ("SENDER", sender),
-        ("Subject", subject or ""),
-        ("Campaign_name", sheet_name or ""),
-        ("Timezone", timezone_str or ""),
-        ("Start_Date", start_date or ""),
-        ("Template", template or ""),
-    ]:
-        if k in col_map:
-            new_row[col_map[k]] = v
-
-    if open_col and open_col in col_map:
-        new_row[col_map[open_col]] = "OPENED"
-
-    if open_col == "Followup1_Open" and "Opened_FW1" in col_map:
-        new_row[col_map["Opened_FW1"]] = "YES"
-    elif open_col == "Followup2_Open" and "Opened_FW2" in col_map:
-        new_row[col_map["Opened_FW2"]] = "YES"
-    elif open_col == "Followup3_Open" and "Opened_FW3" in col_map:
-        new_row[col_map["Opened_FW3"]] = "YES"
+    for key, val in {
+        "Email_ID": email,
+        "Leads_email": email,
+        "Open_timestamp": timestamp,
+        "Last_open_timestamp": timestamp,
+        "Open_status": "OPENED",
+        "Open_count": "1",
+        "From": sender,
+        "SENDER": sender,
+        "Subject": subject or "",
+        "Campaign_name": sheet_name or "",
+        "Timezone": timezone_str or "",
+        "Start_Date": start_date or "",
+        "Template": template or "",
+        open_col: "OPENED" if open_col and open_col in col_map else ""
+    }.items():
+        if key in col_map:
+            new_row[col_map[key]] = val
 
     sheet.append_row(new_row)
     app.logger.info("Appended new open row for email: %s", email)
+
 
 
 @app.route('/', defaults={'path': ''})
